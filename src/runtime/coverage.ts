@@ -34,6 +34,7 @@ import {
   lookupCTradeMethod,
   isContextVar,
   isRuntimeStruct,
+  isStdlibClass,
 } from '../sema/intrinsics';
 
 /**
@@ -288,6 +289,36 @@ const RUNTIME_CTRADE_METHODS: ReadonlySet<string> = new Set<string>([
 ]);
 
 /**
+ * Standard-Library CLASSES the runtime provides for real (`new rt.<Class>(rt)`).
+ *
+ * The intrinsic table's STDLIB_CLASSES set recognises MORE class names than the
+ * runtime implements — a recognised-but-unimplemented class (CiMA, CArrayObj, …)
+ * lowers to `new rt.<Class>(rt)` against an UNDEFINED ctor and throws at run
+ * time, exactly the same landmine shape as an unimplemented free builtin. So a
+ * used stdlib class the runtime doesn't ship must be FLAGGED here.
+ *
+ * IMPLEMENTED this cycle (real, verified non-stub):
+ *   - CTrade        → ./ctrade.ts (the trade wrapper)
+ *   - CPositionInfo → ./stdlib/CPositionInfo.ts (wraps PositionGet* + select)
+ *   - CSymbolInfo   → ./stdlib/CSymbolInfo.ts   (wraps SymbolInfo* + tick)
+ *   - CAccountInfo  → ./stdlib/CAccountInfo.ts  (wraps AccountInfo*)
+ *
+ * EXCLUDED on purpose (recognised in STDLIB_CLASSES but NOT provided), so a
+ * program using one is flagged rather than throwing opaquely at run time:
+ *   - COrderInfo, CDealInfo            — selected pending/deal info wrappers
+ *   - CArrayObj, CArrayDouble, CArrayInt — the container collections
+ *   - CiMA, CiRSI, CiATR, CiMACD, CiStochastic, CiBands — the OO indicator
+ *     wrappers (an EA reads them via the indicator-handle builtins for now).
+ * Each is the honest remainder — implement + add here when needed.
+ */
+const RUNTIME_STDLIB_CLASSES: ReadonlySet<string> = new Set<string>([
+  'CTrade',
+  'CPositionInfo',
+  'CSymbolInfo',
+  'CAccountInfo',
+]);
+
+/**
  * Predefined context variables the runtime provides for real (getters on `rt`).
  *
  * EXCLUDED (recognised in CONTEXT_VARS but NOT on RuntimeApi): _RandomSeed,
@@ -323,10 +354,12 @@ const RUNTIME_STRUCTS_PROVIDED: ReadonlySet<string> = new Set<string>([
 export const RUNTIME_COVERAGE: {
   freeBuiltins: ReadonlySet<string>;
   ctradeMethods: ReadonlySet<string>;
+  stdlibClasses: ReadonlySet<string>;
   contextVars: ReadonlySet<string>;
 } = {
   freeBuiltins: RUNTIME_FREE_BUILTINS,
   ctradeMethods: RUNTIME_CTRADE_METHODS,
+  stdlibClasses: RUNTIME_STDLIB_CLASSES,
   contextVars: RUNTIME_CONTEXT_VARS,
 };
 
@@ -389,6 +422,27 @@ export function checkCoverage(mod: IRModule): Diagnostic[] {
             `Builtin struct '${used}' is recognised but NOT provided by the ` +
             `runtime (\`new rt.${used}()\` would throw at run time). Implement ` +
             `it on the Runtime, or avoid it in the EA.`,
+          symbol: used,
+        });
+      }
+      continue;
+    }
+
+    // Standard-Library CLASS? A used stdlib-class NAME (CTrade, CPositionInfo,
+    // CiMA, …) lowered to `new rt.<Class>(rt)`. Flag it when the runtime doesn't
+    // ship the class — `new rt.<Class>(rt)` would be `new undefined(...)` and
+    // throw at run time, the same landmine as an unimplemented free builtin.
+    // (CTrade.<method> entries are handled above; the bare class name lands here.)
+    if (isStdlibClass(used)) {
+      if (!RUNTIME_STDLIB_CLASSES.has(used)) {
+        diagnostics.push({
+          severity: 'error',
+          code: 'MQL_UNIMPLEMENTED_BUILTIN',
+          message:
+            `Standard-Library class '${used}' is recognised but NOT provided by ` +
+            `the runtime (\`new rt.${used}(rt)\` would throw at run time). ` +
+            `Implement it on the Runtime (see src/runtime/stdlib), or avoid it in ` +
+            `the EA.`,
           symbol: used,
         });
       }

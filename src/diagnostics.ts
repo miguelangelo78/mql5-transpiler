@@ -40,7 +40,24 @@ export type DiagnosticSeverity = 'error' | 'warning' | 'info';
  *  - `MQL_UNIMPLEMENTED_BUILTIN` — a builtin that IS recognised (in the
  *                                intrinsic table) but is NOT implemented in the
  *                                runtime (a throwing stub or absent). THIS is
- *                                the 59-intrinsic landmine.
+ *                                the 59-intrinsic landmine. ALSO covers a
+ *                                recognised Standard-Library CLASS (CiMA,
+ *                                CArrayObj, …) that the runtime does not yet
+ *                                provide — using it would lower to `new
+ *                                rt.<Class>(...)` against an undefined ctor and
+ *                                throw at run time, so it is flagged here too.
+ *  - `MQL_UNSUPPORTED_OVERLOAD` — two or more free functions OR two or more
+ *                                methods of the same class share a name
+ *                                (MQL5/C++ overloading). The transpiler keeps
+ *                                only ONE definition per name (no arity/type
+ *                                dispatch), so the others would be silently
+ *                                dropped — we report it LOUDLY instead (§21).
+ *  - `MQL_UNSUPPORTED_CONSTRUCT` — a syntactic construct the parser recognises
+ *                                but does not lower (an out-of-line method
+ *                                definition `void Class::method(){…}`, or an
+ *                                `operator` overload). The parser skips it
+ *                                cleanly and records this diagnostic rather than
+ *                                throwing an opaque ParseError (§21).
  *  - `MQL_PREPROCESSOR`        — a best-effort preprocessor note (unsupported
  *                                directive / function-like-macro caveat).
  *                                Advisory (`warning`), not fatal.
@@ -50,6 +67,8 @@ export type DiagnosticCode =
   | 'MQL_UNKNOWN_CALL'
   | 'MQL_UNKNOWN_METHOD'
   | 'MQL_UNIMPLEMENTED_BUILTIN'
+  | 'MQL_UNSUPPORTED_OVERLOAD'
+  | 'MQL_UNSUPPORTED_CONSTRUCT'
   | 'MQL_PREPROCESSOR';
 
 export interface Diagnostic {

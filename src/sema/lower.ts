@@ -172,6 +172,11 @@ class Lowerer {
   ) {}
 
   run(): IRModule {
+    // Carry the parser's own diagnostics (recognised-but-unsupported syntactic
+    // constructs it skipped cleanly — operator overloads, out-of-line method
+    // definitions) into the module so they surface alongside lowering findings.
+    for (const d of this.program.diagnostics ?? []) this.report(d);
+
     // ── Pass 1: collect top-level declarations (so calls resolve forward) ──
     for (const decl of this.program.decls) {
       this.collectDecl(decl);
@@ -307,6 +312,16 @@ class Lowerer {
       this.usedBuiltins.add(typeName);
       return { kind: 'New', typeName, args: [], type: { named: typeName, pointer: false } };
     }
+    // Standard-Library classes (CTrade, CPositionInfo, CSymbolInfo, CAccountInfo,
+    // …) are VALUE objects when declared bare (`CPositionInfo pos;`) — MQL5
+    // default-constructs them. The emitter builds `new rt.<Class>(rt)`. This is
+    // applied uniformly to globals, locals, AND fields so a bare stdlib-class
+    // declaration anywhere constructs the runtime object rather than leaving it
+    // `null` (the landmine — a `null` receiver throws on the first method call).
+    if (isStdlibClass(typeName)) {
+      this.usedBuiltins.add(typeName);
+      return { kind: 'New', typeName, args: [], type: { named: typeName, pointer: true } };
+    }
     if (this.userClassDecls.has(typeName) && this.hasClassBody(this.userClassDecls.get(typeName)!)) {
       return { kind: 'New', typeName, args: [], type: { named: typeName, pointer: false } };
     }
@@ -314,22 +329,46 @@ class Lowerer {
   }
 
   /**
-   * Default construction for a bare VALUE field. Like `runtimeStructInit` but
-   * also covers Standard-Library classes (a `CTrade trade;` field is the trade
-   * object; the emitter constructs it `new rt.CTrade(rt)`). Returns the `New`
-   * IRExpr, or undefined for primitives / object-pointers / foreign types.
+   * Default construction for a bare VALUE field. Now identical to
+   * `runtimeStructInit` (which covers runtime structs, Standard-Library classes,
+   * AND user classes) — kept as a named alias so the field-lowering call site
+   * reads intentionally. Returns the `New` IRExpr, or undefined for primitives /
+   * object-pointers / foreign types.
    */
   private fieldConstructionInit(typeName: string): IRExpr | undefined {
-    const rs = this.runtimeStructInit(typeName);
-    if (rs) return rs;
-    if (isStdlibClass(typeName)) {
-      this.usedBuiltins.add(typeName);
-      return { kind: 'New', typeName, args: [], type: { named: typeName, pointer: true } };
-    }
-    return undefined;
+    return this.runtimeStructInit(typeName);
   }
 
+  /**
+   * Names of free functions that have already been DEFINED (a decl WITH a body).
+   * A second definition of the same name is an OVERLOAD — MQL5/C++ permit it via
+   * arity/type dispatch, which the transpiler does NOT implement (it would keep
+   * only one `function NAME` in the emitted module, silently dropping the rest).
+   * We track defined names so a second body is reported LOUDLY (§21), not
+   * dropped. A prototype (no body) followed by one definition is NOT an overload.
+   */
+  private readonly definedFunctionNames = new Set<string>();
+
   private collectFunction(d: FunctionDecl): void {
+    // Detect a second DEFINITION (body) of an already-defined name = overload.
+    if (d.body) {
+      if (this.definedFunctionNames.has(d.name)) {
+        this.report({
+          severity: 'error',
+          code: 'MQL_UNSUPPORTED_OVERLOAD',
+          message:
+            `Function '${d.name}' is overloaded (defined more than once). The ` +
+            `transpiler does not implement arity/type-based overload dispatch, so ` +
+            `only one definition would survive — the others are silently dropped. ` +
+            `Rename the overloads to distinct names, or remove the duplicate.`,
+          span: d.span,
+          symbol: d.name,
+        });
+      } else {
+        this.definedFunctionNames.add(d.name);
+      }
+    }
+
     this.userFunctions.set(d.name, d);
     this.userFunctionNames.add(d.name);
     this.globalScope.define({
@@ -372,8 +411,33 @@ class Lowerer {
     // receiver of this class type can be resolved + classified. Seed each
     // method's async-ness false; the fixpoint raises it (a method that
     // transitively trades is async, exactly like a free function).
+    //
+    // Overload detection (§21): two methods of the SAME class sharing a name
+    // (each with a body) are an overload — the emitter would keep only the last
+    // `NAME(...) { }` method on the TS class, silently dropping the rest. Report
+    // it LOUDLY instead. (A ctor + same-named method can't collide — the ctor's
+    // name equals the class; two same-named non-ctor methods are the overload.)
+    const definedMethodNames = new Set<string>();
     const methods = new Map<string, FunctionDecl>();
     for (const m of d.methods) {
+      if (m.body) {
+        if (definedMethodNames.has(m.name)) {
+          this.report({
+            severity: 'error',
+            code: 'MQL_UNSUPPORTED_OVERLOAD',
+            message:
+              `Method '${d.name}::${m.name}' is overloaded (defined more than ` +
+              `once in the class). The transpiler does not implement arity/type-` +
+              `based overload dispatch, so only one definition would survive — ` +
+              `the others are silently dropped. Rename the overloads to distinct ` +
+              `names, or remove the duplicate.`,
+            span: m.span,
+            symbol: `${d.name}.${m.name}`,
+          });
+        } else {
+          definedMethodNames.add(m.name);
+        }
+      }
       methods.set(m.name, m);
       const key = `${d.name}.${m.name}`;
       if (!this.methodAsync.has(key)) this.methodAsync.set(key, false);

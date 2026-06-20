@@ -56,6 +56,7 @@ import type {
   IRCast,
   IRType,
 } from '../../ir/nodes';
+import { isStdlibClass } from '../../sema/intrinsics';
 
 // ─────────────────────────────────────────────────────────────────────────
 // Public entry point
@@ -254,6 +255,21 @@ class Emitter {
    * emitted un-monomorphised (the type params were untyped during lowering). A
    * note line documents the erasure so the output is self-explaining (§21 —
    * honest about what is and isn't done).
+   *
+   * KNOWN LIMITATION — NON-VIRTUAL DISPATCH (§21, documented, NOT silently
+   * mis-emitted): MQL5/C++ bind a NON-virtual method call statically (to the
+   * type of the reference), whereas a TS class method ALWAYS dispatches
+   * virtually (to the runtime type). So a non-virtual BASE method that calls an
+   * overridden method binds to the BASE implementation in MQL5 but to the
+   * DERIVED override here — a behavioural divergence for code that relies on
+   * static binding. We emit faithful TS classes (every method virtual) rather
+   * than attempting static-binding emulation, which is out of scope. This is
+   * surfaced honestly (this comment + `stillUnimplemented`); it is NOT cheaply
+   * detectable because the parser does not retain the `virtual`/`override`
+   * qualifiers on the AST (see parser.ts parseTypedDecl — virtual/override are
+   * consumed but not stored), so we cannot flag the specific divergent call
+   * sites without first threading those qualifiers through. EAs that override
+   * methods and call them through a non-virtual base method should be reviewed.
    */
   private emitClass(c: IRClass): void {
     if (c.templateParams.length > 0) {
@@ -657,18 +673,22 @@ class Emitter {
 
   private newExpr(e: IRNew): string {
     const args = e.args.map((a) => this.expr(a));
-    if (e.typeName === 'CTrade') {
-      // CTrade is constructed with `rt` first, then any source-supplied args.
-      const rest = args.length > 0 ? `, ${args.join(', ')}` : '';
-      return `new rt.CTrade(rt${rest})`;
-    }
     // A user-declared class/struct is a top-level decl in the emitted module →
-    // construct it BARE (`new Foo(...)`), not through `rt`.
+    // construct it BARE (`new Foo(...)`), not through `rt`. (Checked first so a
+    // user class never collides with a stdlib name.)
     if (this.userClassNames.has(e.typeName)) {
       return `new ${e.typeName}(${args.join(', ')})`;
     }
-    // Runtime structs (MqlTradeRequest/…) and other standard-library classes are
-    // reached through `rt` by name.
+    // Standard-Library classes (CTrade, CPositionInfo, CSymbolInfo, CAccountInfo,
+    // …) are constructed with `rt` FIRST, then any source-supplied args — their
+    // runtime ctors take the Runtime so their accessors reach the broker/feed
+    // state. (CTrade, CPositionInfo, CSymbolInfo, CAccountInfo all match this.)
+    if (isStdlibClass(e.typeName)) {
+      const rest = args.length > 0 ? `, ${args.join(', ')}` : '';
+      return `new rt.${e.typeName}(rt${rest})`;
+    }
+    // Runtime structs (MqlTradeRequest/…) are reached through `rt` by name with
+    // NO `rt` arg (a bare value struct, zero-initialised).
     return `new rt.${e.typeName}(${args.join(', ')})`;
   }
 

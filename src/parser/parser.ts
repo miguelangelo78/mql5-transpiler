@@ -39,6 +39,7 @@ import {
   type VarDeclarator,
 } from './ast';
 import { KEYWORDS, type Token, type TokenKind } from '../lexer/tokens';
+import type { Diagnostic } from '../diagnostics';
 
 export interface ParseOptions {
   /** Properties recorded by the preprocessor (attached to Program). */
@@ -95,12 +96,27 @@ export function parse(tokens: Token[], opts: ParseOptions = {}): Program {
 class Parser {
   private i = 0;
   private readonly toks: Token[];
+  /**
+   * Diagnostics the parser produced for recognised-but-unsupported syntactic
+   * constructs it skipped cleanly (out-of-line method definitions, `operator`
+   * overloads). Attached to the resulting Program; `lower()` merges them into
+   * the IR module's diagnostics. (§21: report the gap loudly, never throw an
+   * opaque ParseError on a construct we KNOW we don't lower.)
+   */
+  private readonly diagnostics: Diagnostic[] = [];
 
   constructor(
     tokens: Token[],
     private readonly opts: ParseOptions,
   ) {
     this.toks = tokens;
+  }
+
+  /** Record a parser diagnostic (deduped per (code, symbol/message)). */
+  private reportDiagnostic(d: Diagnostic): void {
+    const key = `${d.code}:${d.symbol ?? d.message}`;
+    if (this.diagnostics.some((e) => `${e.code}:${e.symbol ?? e.message}` === key)) return;
+    this.diagnostics.push(d);
   }
 
   // ── token cursor ──
@@ -171,6 +187,7 @@ class Parser {
       properties: this.opts.properties ? [...this.opts.properties] : [],
       includes: this.opts.includes ? [...this.opts.includes] : [],
       decls,
+      diagnostics: this.diagnostics.length > 0 ? [...this.diagnostics] : undefined,
       span,
     };
   }
@@ -325,6 +342,17 @@ class Parser {
       // virtual/override/extern: noted but not stored on VarDecl/FunctionDecl in PoC.
     }
 
+    // ── §21 recognised-but-unsupported constructs: operator overloads + out-of-
+    //    line method definitions. The parser does NOT lower these (full operator
+    //    overloading / out-of-line member resolution is out of scope), but it
+    //    MUST NOT throw an opaque ParseError on them. Detect, record an
+    //    MQL_UNSUPPORTED_CONSTRUCT diagnostic, and SKIP the declaration cleanly
+    //    so the rest of the file still parses (and the EA reports the gap loudly
+    //    instead of crashing). ──
+    if (this.atUnsupportedConstruct()) {
+      return this.skipUnsupportedConstruct(ctx);
+    }
+
     // Constructor/destructor inside a class: `ClassName(...)` or `~ClassName(...)`.
     if (ctx?.inClass) {
       const ctorLike = this.tryParseCtorDtor(startTok, ctx.className!);
@@ -332,7 +360,21 @@ class Parser {
     }
 
     const type = this.parseType();
-    const name = this.expect('Identifier').value;
+
+    // An out-of-line definition / qualified name reaches here when the construct
+    // detector missed it (e.g. a templated return type). Guard the name `expect`
+    // so a `::` after the type-name still degrades to a clean skip rather than a
+    // ParseError. (Defensive — atUnsupportedConstruct catches the common shapes.)
+    if (!this.at('Identifier')) {
+      return this.skipUnsupportedConstruct(ctx);
+    }
+    const name = this.next().value;
+
+    // Out-of-line member: `<type> Class::method(...)`. `name` was the class; the
+    // next token is `::`. Skip cleanly (we don't lower out-of-line definitions).
+    if (this.at('Scope')) {
+      return this.skipUnsupportedConstruct(ctx, name);
+    }
 
     // Function?  `name(` — but distinguish from a var initialised by a constructor
     // call, which MQL5 doesn't have at declaration in this subset, so `(` ⇒ function.
@@ -342,6 +384,136 @@ class Parser {
 
     // Otherwise: variable declaration with one or more declarators.
     return this.finishVarDecl(startTok, type, name, isStatic, isConst);
+  }
+
+  /**
+   * Non-destructive lookahead: does the cursor sit at the head of a construct we
+   * recognise but do not lower? Currently:
+   *   - an `operator` overload anywhere in the declaration head (`type
+   *     operator+(...)`, `operator T() const`, etc.), OR
+   *   - an out-of-line member definition `type Class::method(...)` (a `::` in the
+   *     declaration HEAD — before the param list and before any initializer).
+   * Returns true WITHOUT consuming any tokens; the caller skips the declaration.
+   *
+   * IMPORTANT — scan ONLY the declaration head: stop at the first `(` (param
+   * list), `{` (body), `;` (end), `=` (an INITIALIZER begins), `[` (an array
+   * dimension begins), or `,` (next declarator). This is what prevents a false
+   * positive on a legitimate global whose INITIALIZER or array size uses scope
+   * resolution — e.g. `Color g_c = Color::Green;` or `int a[Foo::N];` carry a
+   * `::` that is NOT an out-of-line definition. The out-of-line `::` and the
+   * `operator` keyword always appear in the head, before any of those.
+   */
+  private atUnsupportedConstruct(): boolean {
+    for (let k = 0; k < 8; k++) {
+      const t = this.peek(k);
+      if (t.kind === 'EOF') break;
+      if (t.kind === 'Keyword' && t.value === 'operator') return true;
+      // End of the declaration head — anything past here is params / body /
+      // initializer / array dim / next declarator, NOT the construct head.
+      if (
+        t.kind === 'LParen' ||
+        t.kind === 'LBrace' ||
+        t.kind === 'Semicolon' ||
+        t.kind === 'LBracket' ||
+        t.kind === 'Comma' ||
+        (t.kind === 'Operator' && t.value === '=')
+      ) {
+        break;
+      }
+      // `Class::` in the head (before the param list / initializer) ⇒ an
+      // out-of-line member definition.
+      if (t.kind === 'Scope') return true;
+    }
+    return false;
+  }
+
+  /**
+   * Skip a recognised-but-unsupported declaration (operator overload / out-of-
+   * line method) cleanly: consume tokens up to and including its terminator —
+   * a balanced `{...}` body, or a `;` prototype — and record one
+   * MQL_UNSUPPORTED_CONSTRUCT diagnostic. Never throws.
+   */
+  private skipUnsupportedConstruct(
+    ctx?: { inClass?: boolean; className?: string },
+    qualifier?: string,
+  ): Decl | null {
+    const startTok = this.peek();
+    // Build a human-readable symbol for the diagnostic from the declaration HEAD
+    // (the tokens up to the param-list `(`), tightly joined: `void CFoo::bar`,
+    // `V operator+`. Used for dedup + the message.
+    const headParts: string[] = [];
+    let inHead = true; // collecting the signature head (before the param list)
+    let isOperator = false;
+    let isOutOfLine = false;
+    // Consume tokens until we reach the body `{` or a `;` terminator at this
+    // nesting, tracking paren depth so a `(` in the head doesn't end us early.
+    let parenDepth = 0;
+    while (!this.isEOF()) {
+      const t = this.peek();
+      if (t.kind === 'Keyword' && t.value === 'operator') isOperator = true;
+      if (t.kind === 'Scope') isOutOfLine = true;
+      if (t.kind === 'LParen') {
+        if (parenDepth === 0) inHead = false; // entering the param list
+        parenDepth++;
+      } else if (t.kind === 'RParen') {
+        if (parenDepth > 0) parenDepth--;
+      } else if (parenDepth === 0 && t.kind === 'LBrace') {
+        // A definition body: skip the balanced braces and we're done.
+        this.skipBalancedBraces();
+        break;
+      } else if (parenDepth === 0 && t.kind === 'Semicolon') {
+        this.next(); // prototype terminator
+        break;
+      } else if (parenDepth === 0 && t.kind === 'RBrace') {
+        // We hit the enclosing class's closing brace without a body/`;` — stop
+        // WITHOUT consuming it (the class parser owns it).
+        break;
+      }
+      if (inHead && headParts.length < 12 && t.value) headParts.push(t.value);
+      this.next();
+    }
+
+    const kindLabel = isOperator
+      ? 'operator overload'
+      : isOutOfLine
+        ? 'out-of-line method definition'
+        : 'declaration';
+    // Join the head tightly: no space around `::`, the `operator` keyword glued
+    // to its operator token, a single space between other tokens.
+    let symbol = '';
+    for (let k = 0; k < headParts.length; k++) {
+      const tok = headParts[k];
+      const prev = headParts[k - 1];
+      const glue =
+        symbol === '' || tok === '::' || prev === '::' || prev === 'operator';
+      symbol += glue ? tok : ' ' + tok;
+    }
+    symbol = qualifier && symbol === '' ? qualifier : symbol;
+    this.reportDiagnostic({
+      severity: 'error',
+      code: 'MQL_UNSUPPORTED_CONSTRUCT',
+      message:
+        `Unsupported ${kindLabel}` +
+        (ctx?.inClass && ctx.className ? ` in class '${ctx.className}'` : '') +
+        `: the transpiler recognises but does not lower this construct ` +
+        `(it was skipped). ${isOperator ? 'Operator overloading' : 'Out-of-line member definitions'} ` +
+        `are out of scope — define the method inline in the class body, or avoid ` +
+        `the operator overload.`,
+      span: this.spanFrom(startTok),
+      symbol: symbol || kindLabel,
+    });
+    return null; // nothing lowered for a skipped construct
+  }
+
+  /** Skip a balanced `{ ... }` block (used to drop an unsupported def body). */
+  private skipBalancedBraces(): void {
+    this.expect('LBrace');
+    let depth = 1;
+    while (depth > 0 && !this.isEOF()) {
+      const t = this.next();
+      if (t.kind === 'LBrace') depth++;
+      else if (t.kind === 'RBrace') depth--;
+    }
   }
 
   private tryParseCtorDtor(startTok: Token, className: string): FunctionDecl | null {

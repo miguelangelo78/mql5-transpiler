@@ -52,6 +52,15 @@ export interface Program {
   includes: IncludeRecord[];
   /** Top-level declarations in source order. */
   decls: Decl[];
+  /**
+   * Diagnostics the PARSER itself produced (recognised-but-unsupported syntactic
+   * constructs it skipped cleanly rather than throwing — out-of-line method
+   * definitions, `operator` overloads). Optional/additive: producers that don't
+   * set it leave it `undefined`. `lower()` merges these into the IR module's
+   * diagnostics so they surface alongside lowering findings. (See parser.ts +
+   * ../diagnostics.ts MQL_UNSUPPORTED_CONSTRUCT.)
+   */
+  diagnostics?: import('../diagnostics').Diagnostic[];
   span: Span;
 }
 

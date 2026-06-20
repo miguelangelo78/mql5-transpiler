@@ -82,6 +82,61 @@ export interface ICTrade {
 
 export type CTradeCtor = new (rt: Runtime) => ICTrade;
 
+// ── Standard-Library info classes (constructed `new rt.<Class>(rt)`, like
+//    CTrade). Thin OO wrappers over the PositionGet*/SymbolInfo*/AccountInfo*
+//    builtins — see ./stdlib/*. The interfaces are the wrapper class types. ──
+
+/** MT5 `CPositionInfo` — wraps the selected-position state + PositionGet*. */
+export interface ICPositionInfo {
+  SelectByTicket(ticket: number): boolean;
+  Select(symbol: string): boolean;
+  Symbol(): string;
+  PositionType(): number;
+  Volume(): number;
+  PriceOpen(): number;
+  StopLoss(): number;
+  TakeProfit(): number;
+  Profit(): number;
+  Swap(): number;
+  Magic(): number;
+  Comment(): string;
+  Ticket(): number;
+  Time(): number;
+}
+
+/** MT5 `CSymbolInfo` — wraps a bound symbol + the SymbolInfo + tick reads. */
+export interface ICSymbolInfo {
+  Name(symbol: string): boolean;
+  Name(): string;
+  Refresh(): boolean;
+  RefreshRates(): boolean;
+  Bid(): number;
+  Ask(): number;
+  Point(): number;
+  Digits(): number;
+  Spread(): number;
+  VolumeMin(): number;
+  VolumeMax(): number;
+  VolumeStep(): number;
+  TickValue(): number;
+}
+
+/** MT5 `CAccountInfo` — wraps the AccountInfo* builtins. */
+export interface ICAccountInfo {
+  Login(): number;
+  Leverage(): number;
+  Balance(): number;
+  Equity(): number;
+  Margin(): number;
+  FreeMargin(): number;
+  Profit(): number;
+  Currency(): string;
+}
+
+export type CPositionInfoCtor = new (rt: Runtime) => ICPositionInfo;
+export type CSymbolInfoCtor = new (rt: Runtime) => ICSymbolInfo;
+export type CAccountInfoCtor = new (rt: Runtime) => ICAccountInfo;
+
 /**
  * Constructors for MQL5's builtin trade-API structs (`new rt.MqlTradeRequest()`,
  * etc.). Unlike CTrade these take NO `rt` arg — a bare MQL5 declaration
@@ -267,6 +322,12 @@ export interface RuntimeApi {
 
   // ── Standard-Library classes ──
   readonly CTrade: CTradeCtor;
+  /** MT5 `CPositionInfo` — `new rt.CPositionInfo(rt)` (see ./stdlib). */
+  readonly CPositionInfo: CPositionInfoCtor;
+  /** MT5 `CSymbolInfo` — `new rt.CSymbolInfo(rt)`. */
+  readonly CSymbolInfo: CSymbolInfoCtor;
+  /** MT5 `CAccountInfo` — `new rt.CAccountInfo(rt)`. */
+  readonly CAccountInfo: CAccountInfoCtor;
 
   // ── builtin trade-API struct constructors (`new rt.MqlTradeRequest()` — no
   //    `rt` arg; a bare MQL5 `MqlTradeRequest req;` zero-inits a value struct) ──

@@ -90,6 +90,32 @@ function fillResult(result: MqlTradeResult, res: TradeResult): void {
   // boundary; leave them at their zero-init values rather than fabricating (§21).
 }
 
+/**
+ * Resolve the symbol the SL/TP (or close-by) op targets, MT5-faithfully.
+ *
+ * MT5 keys TRADE_ACTION_SLTP on `request.position` — the POSITION TICKET — NOT
+ * on `request.symbol` (a position is identified by its ticket; the symbol is
+ * derived). So when `request.position` is set (a real ticket; §29: 0 ⇒ "not
+ * specified", since a position ticket is never 0), we look that position up by
+ * ticket and use ITS symbol. Only when no position ticket is supplied do we fall
+ * back to `request.symbol` (some EAs fill only the symbol for a netting account,
+ * where symbol uniquely identifies the position). Returns null when a ticket was
+ * given but no open position matches it — the caller rejects honestly (§21)
+ * rather than silently modifying the wrong/"by-symbol" position.
+ */
+function resolvePositionSymbol(
+  broker: IBroker,
+  position: number,
+  fallbackSymbol: string,
+): string | null {
+  if (position !== 0) {
+    const pos = broker.positions().find((p) => p.ticket === position);
+    return pos ? pos.symbol : null;
+  }
+  // No ticket supplied → use the request symbol (netting: symbol ⇒ the position).
+  return fallbackSymbol !== '' ? fallbackSymbol : null;
+}
+
 /** Set `result` to a local rejection with the given retcode + comment (no I/O). */
 function reject(result: MqlTradeResult, retcode: number, comment: string): boolean {
   result.retcode = retcode;
@@ -174,10 +200,23 @@ export async function orderSend(
     }
 
     case TRADE_ACTION_SLTP: {
-      // Modify the SL/TP of the position on `symbol`. (MT5 keys on `position`
-      // ticket; the netting boundary modifies by symbol — symbol is the
-      // load-bearing operand here.)
-      const res = await broker.modifyPosition(request.symbol, request.sl, request.tp);
+      // Modify the SL/TP of a position. MT5 keys on `request.position` (the
+      // POSITION TICKET). We resolve the ticket → its symbol, then modify via the
+      // netting boundary (modifyPosition is keyed by symbol). Fall back to
+      // `request.symbol` only when no ticket was supplied. If a ticket was given
+      // but matches no open position, reject honestly (don't silently modify a
+      // different position; §21).
+      const symbol = resolvePositionSymbol(broker, request.position, request.symbol);
+      if (symbol === null) {
+        return reject(
+          result,
+          TRADE_RETCODE_INVALID,
+          request.position !== 0
+            ? `OrderSend: TRADE_ACTION_SLTP position ticket ${request.position} not found`
+            : 'OrderSend: TRADE_ACTION_SLTP requires request.position (ticket) or request.symbol',
+        );
+      }
+      const res = await broker.modifyPosition(symbol, request.sl, request.tp);
       fillResult(result, res);
       return result.retcode === TRADE_RETCODE_DONE;
     }
@@ -217,12 +256,17 @@ export async function orderSend(
     }
 
     case TRADE_ACTION_CLOSE_BY: {
-      // No closeBy primitive on the IBroker boundary. Reject honestly rather
-      // than silently dropping the request (§21).
+      // MT5 keys CLOSE_BY on TWO position TICKETS: `request.position` (the
+      // position to close) and `request.position_by` (the opposite position).
+      // There is no closeBy primitive on the IBroker boundary, so we reject
+      // honestly rather than silently dropping the request (§21) — but we report
+      // the ticket operands so the failure is diagnosable (and we don't
+      // mistakenly key on `request.symbol`, which CLOSE_BY does not use).
       return reject(
         result,
         TRADE_RETCODE_INVALID,
-        'OrderSend: TRADE_ACTION_CLOSE_BY is not supported by this egress',
+        `OrderSend: TRADE_ACTION_CLOSE_BY (position ${request.position} by ` +
+          `${request.position_by}) is not supported by this egress`,
       );
     }
 

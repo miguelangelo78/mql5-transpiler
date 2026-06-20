@@ -26,6 +26,9 @@ import type {
   Runtime,
   RuntimeApi,
   CTradeCtor,
+  CPositionInfoCtor,
+  CSymbolInfoCtor,
+  CAccountInfoCtor,
   MqlTradeRequestCtor,
   MqlTradeResultCtor,
   MqlTradeCheckResultCtor,
@@ -49,6 +52,9 @@ import {
 } from './arrays';
 import { PositionState } from './positions';
 import { CTrade } from './ctrade';
+import { CPositionInfo } from './stdlib/CPositionInfo';
+import { CSymbolInfo } from './stdlib/CSymbolInfo';
+import { CAccountInfo } from './stdlib/CAccountInfo';
 import { iBars, iVolume, iHighest, iLowest } from './indicators/series';
 import { OrderState, positionGetTicket } from './orders';
 import { HistoryState } from './history';
@@ -162,6 +168,12 @@ class RuntimeImpl implements RuntimeApi {
   private customHandleCounter = 0;
 
   readonly CTrade: CTradeCtor;
+  // Standard-Library info classes (assigned as the CLASSES; constructed
+  // `new rt.CPositionInfo(rt)` etc. — thin wrappers over PositionGet*/SymbolInfo*
+  // /AccountInfo*, see ./stdlib/*).
+  readonly CPositionInfo: CPositionInfoCtor = CPositionInfo as unknown as CPositionInfoCtor;
+  readonly CSymbolInfo: CSymbolInfoCtor = CSymbolInfo as unknown as CSymbolInfoCtor;
+  readonly CAccountInfo: CAccountInfoCtor = CAccountInfo as unknown as CAccountInfoCtor;
   // Builtin trade-API struct constructors (assigned as the CLASSES, not
   // instances): `new rt.MqlTradeRequest()` zero-inits a fresh value struct.
   readonly MqlTradeRequest: MqlTradeRequestCtor = MqlTradeRequest;
