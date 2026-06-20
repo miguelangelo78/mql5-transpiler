@@ -39,6 +39,8 @@ function makeMock() {
   const client = {
     sessions: {
       start: async (p: unknown) => { rec('start', p); return { accountId: 'acc_test', isDemo: true, status: 'connected' }; },
+      keepAlive: async (p: unknown) => { rec('keepAlive', p); return { accountId: 'acc_test', isDemo: true, status: 'connected' }; },
+      stopKeepAlive: (id: unknown) => { rec('stopKeepAlive', id); },
       end: async (id: unknown) => { rec('end', id); },
     },
     accounts: {

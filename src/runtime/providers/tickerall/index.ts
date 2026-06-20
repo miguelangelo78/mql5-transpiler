@@ -55,6 +55,9 @@ export interface TickerallProviderConfig {
   streamUrl?: string;
   /** Inject a pre-built / mock Tickerall client (testing). Defaults to a new one. */
   client?: Tickerall;
+  /** Observability hook fired when the client transparently re-arms a cooled
+   *  account. Defaults to a stderr note. */
+  onRearm?: (accountId: string) => void;
 }
 
 export interface TickerallProviders {
@@ -76,10 +79,18 @@ export async function createTickerallProviders(
     apiKey: config.apiKey,
     ...(config.baseUrl !== undefined ? { baseUrl: config.baseUrl } : {}),
     ...(config.streamUrl !== undefined ? { streamUrl: config.streamUrl } : {}),
+    // Observability: fired when the client transparently re-arms a cooled
+    // account (it re-supplies creds + retries the call under the hood).
+    onRearm: config.onRearm ?? ((id) => { process.stderr.write(`[tickerall] re-armed cooled account ${id}\n`); }),
   });
 
-  // 1. Connect the broker account.
-  const session = await client.sessions.start({
+  // 1. Connect the broker account — keepAlive (NOT start): it caches the broker
+  //    credentials in-process so the SDK client TRANSPARENTLY re-arms (re-supplies
+  //    creds + retries) whenever a later call hits BROKER_ACCOUNT_NOT_HOT (the
+  //    account "went cold"). A long-running live EA must survive its connection
+  //    cooling without manual reconnects; plain start() would not. disconnect()
+  //    -> sessions.end() also stops keeping it alive (drops the cached creds).
+  const session = await client.sessions.keepAlive({
     broker: config.broker,
     server: config.server,
     account: config.account,
