@@ -4,6 +4,14 @@
   "private": true,
   "type": "module",
   "description": "Transpiles MQL5 source into TypeScript and runs the strategy on a pluggable backtest/live engine.",
+  "license": "MIT",
+  "author": "Miguel",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/miguelangelo78/mql5-transpiler.git"
+  },
+  "homepage": "https://github.com/miguelangelo78/mql5-transpiler#readme",
+  "keywords": ["mql5", "metatrader", "mt5", "transpiler", "trading", "backtest", "expert-advisor"],
   "engines": {
     "node": ">=20"
   },
