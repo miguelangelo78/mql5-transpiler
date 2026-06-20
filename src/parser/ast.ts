@@ -118,6 +118,13 @@ export interface FunctionDecl {
   params: Param[];
   /** undefined = forward declaration / prototype (no body). */
   body?: Block;
+  /**
+   * Template type-parameter names when this function was introduced by a
+   * `template<typename T, ...>` header. Empty for a plain function. Optional/
+   * additive: pre-existing producers that don't set it are unaffected (treated
+   * as `[]`). Erasure semantics — see lower.ts.
+   */
+  templateParams?: string[];
   span: Span;
 }
 
@@ -136,6 +143,14 @@ export interface StructDecl {
   base?: string;
   fields: VarDecl[];
   methods: FunctionDecl[];
+  /**
+   * Template type-parameter names when this decl was introduced by a
+   * `template<typename T, ...>` header (e.g. `['T']`). Empty for a plain class.
+   * Templates are handled by ERASURE (see lower.ts): the body is emitted
+   * un-monomorphised with the type params treated as untyped. Additive field;
+   * a plain (non-template) StructDecl leaves it `[]`.
+   */
+  templateParams: string[];
   span: Span;
 }
 

@@ -47,11 +47,14 @@ import {
   type IRBlock,
   type IRCall,
   type IRCallTarget,
+  type IRClass,
   type IRExpr,
+  type IRField,
   type IRFor,
   type IRFunction,
   type IRGlobal,
   type IRInput,
+  type IRMethod,
   type IRModule,
   type IRParam,
   type IRPrim,
@@ -63,6 +66,7 @@ import {
 import {
   isBuiltinConst,
   isContextVar,
+  isRuntimeStruct,
   isStdlibClass,
   lookupCTradeMethod,
   lookupFreeIntrinsic,
@@ -131,10 +135,27 @@ class Lowerer {
   private readonly usedBuiltins = new Set<string>();
   /** Struct/class names declared by the user. */
   private readonly userTypes = new Set<string>();
+  /** The AST StructDecl for each user class/struct name (for body lowering). */
+  private readonly userClassDecls = new Map<string, StructDecl>();
+  /** Per-class method-name → FunctionDecl (for receiver method-call resolution). */
+  private readonly classMethods = new Map<string, Map<string, FunctionDecl>>();
+  /**
+   * async-ness per (class, method), keyed `"Class.method"`, computed by the
+   * SAME fixpoint as free functions. A method that transitively trades is async.
+   */
+  private readonly methodAsync = new Map<string, boolean>();
+  /**
+   * Side-table: each user-class method-call IRCall → the `"OwnerClass.method"`
+   * key it dispatches to. Lets the async fixpoint resolve a user-class method
+   * call's async-ness against `methodAsync` even though the IRCall's `method`
+   * target carries no owning-class field. (Kept off the IR to stay additive.)
+   */
+  private readonly methodCallKey = new Map<IRCall, string>();
 
   private readonly inputs: IRInput[] = [];
   private readonly globals: IRGlobal[] = [];
   private readonly functions: IRFunction[] = [];
+  private readonly classes: IRClass[] = [];
   private readonly events: Partial<Record<EventName, string>> = {};
   /** Compile-time diagnostics collected while lowering (see ../diagnostics.ts). */
   private readonly diagnostics: Diagnostic[] = [];
@@ -156,14 +177,16 @@ class Lowerer {
       this.collectDecl(decl);
     }
 
-    // ── Pass 2: lower bodies ──
+    // ── Pass 2: lower bodies (free functions, then user-class methods) ──
     for (const decl of this.program.decls) {
       if (decl.kind === 'FunctionDecl' && decl.body) {
         this.lowerFunction(decl);
+      } else if (decl.kind === 'StructDecl' && this.hasClassBody(decl)) {
+        this.lowerClass(decl);
       }
     }
 
-    // ── Pass 3: async fixpoint over user functions ──
+    // ── Pass 3: async fixpoint over user functions AND user-class methods ──
     this.computeAsyncFixpoint();
     // Re-apply the converged async-ness onto the emitted IRFunctions + their
     // call sites (a callee may have flipped async after we first lowered it).
@@ -172,16 +195,29 @@ class Lowerer {
       fn.isAsync = isAsync;
       this.applyAsyncToUserCalls(fn.body);
     }
+    for (const cls of this.classes) {
+      for (const m of cls.methods) {
+        const key = `${cls.name}.${m.name}`;
+        m.isAsync = this.methodAsync.get(key) ?? m.isAsync;
+        this.applyAsyncToUserCalls(m.body);
+      }
+    }
 
     return {
       name: this.opts.name ?? this.deriveName(),
       inputs: this.inputs,
       globals: this.globals,
       functions: this.functions,
+      classes: this.classes,
       usedBuiltins: [...this.usedBuiltins].sort(),
       events: this.events,
       diagnostics: this.diagnostics,
     };
+  }
+
+  /** True if this struct/class decl has a real body (any field or method). */
+  private hasClassBody(d: StructDecl): boolean {
+    return d.fields.length > 0 || d.methods.length > 0;
   }
 
   /** Push a diagnostic once per distinct (code, symbol) pair. */
@@ -236,7 +272,13 @@ class Lowerer {
       this.globalScope.define({ name: dec.name, kind: 'global', type: declType });
       this.varTypes.set(dec.name, declType);
       const arrayDims = dec.arrayDims.map((e) => (e ? this.foldConst(this.lowerExprBare(e)) : null));
-      const init = dec.init ? this.foldConst(this.lowerExprBare(dec.init)) : undefined;
+      let init = dec.init ? this.foldConst(this.lowerExprBare(dec.init)) : undefined;
+      // A bare runtime-struct / user-class VALUE decl (`MqlTradeRequest req;`,
+      // `MyClass c;`) is default-constructed in MQL5. An object-POINTER
+      // (`MyClass *p;`) is null until `new` — leave it to the default.
+      if (init === undefined && dec.arrayDims.length === 0 && d.type.pointer === 0) {
+        init = this.runtimeStructInit(d.type.name) ?? init;
+      }
       this.globals.push({
         name: dec.name,
         type: declType,
@@ -246,6 +288,45 @@ class Lowerer {
         arrayDims,
       });
     }
+  }
+
+  /**
+   * Synthesize the default construction for a bare (no-init, non-array,
+   * non-pointer) declaration of a constructible named type:
+   *   - a builtin runtime struct (MqlTradeRequest/MqlTradeResult/…)  →
+   *     `new rt.<typeName>()`
+   *   - a user-declared class/struct WITH a body (own/inherited methods or
+   *     fields)                                                        →
+   *     `new <typeName>()`  (a value instance — MQL5 default-constructs it)
+   * Returns the `New` IRExpr, or undefined to keep the caller's default-init
+   * behaviour (primitives, object-pointers, foreign types). The pointer guard
+   * is applied by the caller (an object-pointer `Foo *p;` stays null).
+   */
+  private runtimeStructInit(typeName: string): IRExpr | undefined {
+    if (isRuntimeStruct(typeName)) {
+      this.usedBuiltins.add(typeName);
+      return { kind: 'New', typeName, args: [], type: { named: typeName, pointer: false } };
+    }
+    if (this.userClassDecls.has(typeName) && this.hasClassBody(this.userClassDecls.get(typeName)!)) {
+      return { kind: 'New', typeName, args: [], type: { named: typeName, pointer: false } };
+    }
+    return undefined;
+  }
+
+  /**
+   * Default construction for a bare VALUE field. Like `runtimeStructInit` but
+   * also covers Standard-Library classes (a `CTrade trade;` field is the trade
+   * object; the emitter constructs it `new rt.CTrade(rt)`). Returns the `New`
+   * IRExpr, or undefined for primitives / object-pointers / foreign types.
+   */
+  private fieldConstructionInit(typeName: string): IRExpr | undefined {
+    const rs = this.runtimeStructInit(typeName);
+    if (rs) return rs;
+    if (isStdlibClass(typeName)) {
+      this.usedBuiltins.add(typeName);
+      return { kind: 'New', typeName, args: [], type: { named: typeName, pointer: true } };
+    }
+    return undefined;
   }
 
   private collectFunction(d: FunctionDecl): void {
@@ -283,11 +364,21 @@ class Lowerer {
   }
 
   private collectStruct(d: StructDecl): void {
-    if (d.name) {
-      this.userTypes.add(d.name);
+    if (!d.name) return;
+    this.userTypes.add(d.name);
+    this.userClassDecls.set(d.name, d);
+
+    // Register the class's methods (name → FunctionDecl) so a method call on a
+    // receiver of this class type can be resolved + classified. Seed each
+    // method's async-ness false; the fixpoint raises it (a method that
+    // transitively trades is async, exactly like a free function).
+    const methods = new Map<string, FunctionDecl>();
+    for (const m of d.methods) {
+      methods.set(m.name, m);
+      const key = `${d.name}.${m.name}`;
+      if (!this.methodAsync.has(key)) this.methodAsync.set(key, false);
     }
-    // Struct methods are not hoisted as free user functions in the PoC; they are
-    // only reachable via member calls on a struct instance (out of PoC trade path).
+    this.classMethods.set(d.name, methods);
   }
 
   // ───────────────────────────────────────────────────────────────────────
@@ -317,6 +408,138 @@ class Lowerer {
       isAsync: localAsync,
       event,
     });
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Pass 2 — lower user-class / struct bodies
+  // ───────────────────────────────────────────────────────────────────────
+
+  /**
+   * The class currently being lowered. Inside a method body, this lets us:
+   *   - resolve a bare `field` / `method()` reference to `this.field` /
+   *     `this.method()` (MQL5 allows the implicit `this`),
+   *   - classify a `this.method(...)` / receiver-of-this-class method call,
+   *   - mark the enclosing method async when it trades (fixpoint key).
+   * `undefined` outside any method (free functions, globals).
+   */
+  private currentClass?: {
+    name: string;
+    /** field name → field type (own + inherited). */
+    fields: Map<string, IRType>;
+    /** method names (own + inherited). */
+    methods: Set<string>;
+  };
+
+  private lowerClass(d: StructDecl): void {
+    // Build the member view (own + inherited fields/methods) used to resolve
+    // bare/`this`-qualified member references inside the methods.
+    const fieldTypes = this.collectClassFieldTypes(d.name);
+    const methodNames = this.collectClassMethodNames(d.name);
+
+    const irFields: IRField[] = [];
+    for (const fieldDecl of d.fields) {
+      const baseType = this.mapType(fieldDecl.type);
+      for (const dec of fieldDecl.declarators) {
+        const declType = this.applyArrayType(baseType, dec.arrayDims.length);
+        const arrayDims = dec.arrayDims.map((e) =>
+          e ? this.foldConst(this.lowerExprBare(e)) : null,
+        );
+        let init = dec.init ? this.foldConst(this.lowerExprBare(dec.init)) : undefined;
+        // A bare VALUE field of a constructible type (a stdlib class like
+        // `CTrade trade;`, a runtime struct, or a user class) is default-
+        // constructed in MQL5 — synthesize the construction. An object-pointer
+        // field (`Foo *p;`) stays null. (Mirrors the global/local convention.)
+        if (init === undefined && dec.arrayDims.length === 0 && fieldDecl.type.pointer === 0) {
+          init = this.fieldConstructionInit(fieldDecl.type.name) ?? init;
+        }
+        irFields.push({ name: dec.name, type: declType, init, arrayDims });
+      }
+    }
+
+    const prevClass = this.currentClass;
+    this.currentClass = { name: d.name, fields: fieldTypes, methods: methodNames };
+    const irMethods: IRMethod[] = [];
+    try {
+      for (const methodDecl of d.methods) {
+        if (!methodDecl.body) continue; // prototype-only method: nothing to emit
+        irMethods.push(this.lowerMethod(d.name, methodDecl));
+      }
+    } finally {
+      this.currentClass = prevClass;
+    }
+
+    this.classes.push({
+      name: d.name,
+      keyword: d.keyword,
+      base: d.base,
+      fields: irFields,
+      methods: irMethods,
+      templateParams: d.templateParams ?? [],
+    });
+  }
+
+  private lowerMethod(className: string, d: FunctionDecl): IRMethod {
+    const scope = new Scope(this.globalScope);
+    const params: IRParam[] = [];
+    for (const p of d.params) {
+      params.push(this.lowerParam(p, scope));
+    }
+    const body = this.lowerBlock(d.body!, scope);
+    const returnType = this.mapType(d.returnType);
+
+    const isCtor = d.name === className;
+    const isDtor = d.name === `~${className}`;
+
+    // Provisional async-ness from this body's own call sites (raised by fixpoint).
+    const key = `${className}.${d.name}`;
+    const localAsync = this.blockHasAsyncCall(body);
+    this.methodAsync.set(key, localAsync || (this.methodAsync.get(key) ?? false));
+
+    return {
+      name: d.name,
+      returnType,
+      params,
+      body,
+      isAsync: localAsync,
+      isCtor,
+      isDtor,
+    };
+  }
+
+  /** Own + inherited field name → type for a user class (single inheritance). */
+  private collectClassFieldTypes(className: string): Map<string, IRType> {
+    const out = new Map<string, IRType>();
+    let cur: string | undefined = className;
+    const seen = new Set<string>();
+    while (cur && this.userClassDecls.has(cur) && !seen.has(cur)) {
+      seen.add(cur);
+      const d: StructDecl = this.userClassDecls.get(cur)!;
+      for (const fieldDecl of d.fields) {
+        const baseType = this.mapType(fieldDecl.type);
+        for (const dec of fieldDecl.declarators) {
+          // A derived field shadows a base one; don't overwrite an own field.
+          if (!out.has(dec.name)) {
+            out.set(dec.name, this.applyArrayType(baseType, dec.arrayDims.length));
+          }
+        }
+      }
+      cur = d.base;
+    }
+    return out;
+  }
+
+  /** Own + inherited method names for a user class (single inheritance). */
+  private collectClassMethodNames(className: string): Set<string> {
+    const out = new Set<string>();
+    let cur: string | undefined = className;
+    const seen = new Set<string>();
+    while (cur && this.userClassDecls.has(cur) && !seen.has(cur)) {
+      seen.add(cur);
+      const d: StructDecl = this.userClassDecls.get(cur)!;
+      for (const m of d.methods) out.add(m.name);
+      cur = d.base;
+    }
+    return out;
   }
 
   private lowerParam(p: Param, scope: Scope): IRParam {
@@ -431,7 +654,12 @@ class Lowerer {
       scope.define({ name: dec.name, kind: 'local', type: declType });
       this.varTypes.set(dec.name, declType);
       const arrayDims = dec.arrayDims.map((e) => (e ? this.foldConst(this.lowerExpr(e, scope)) : null));
-      const init = dec.init ? this.lowerExpr(dec.init, scope) : undefined;
+      let init = dec.init ? this.lowerExpr(dec.init, scope) : undefined;
+      // A bare runtime-struct / user-class VALUE local is default-constructed.
+      // An object-POINTER (`MyClass *p;`) stays null until `new`.
+      if (init === undefined && dec.arrayDims.length === 0 && d.type.pointer === 0) {
+        init = this.runtimeStructInit(d.type.name) ?? init;
+      }
       irDecls.push({
         kind: 'VarDecl',
         name: dec.name,
@@ -531,6 +759,13 @@ class Lowerer {
   }
 
   private lowerIdentifier(name: string, scope: Scope, span?: Span): IRExpr {
+    // 0. `this` inside a user-class method → the bare `this` receiver.
+    if (name === 'this') {
+      const t: IRType = this.currentClass
+        ? { named: this.currentClass.name, pointer: true }
+        : T.unknown;
+      return { kind: 'Ref', binding: { kind: 'thisRef' }, type: t };
+    }
     // 1. context vars (_Symbol, _Period, ...)
     if (isContextVar(name)) {
       this.usedBuiltins.add(name);
@@ -541,6 +776,20 @@ class Lowerer {
     if (sym) {
       const binding = this.symbolToBinding(sym);
       return { kind: 'Ref', binding, type: sym.type };
+    }
+    // 2b. implicit `this`: a bare member of the current class (field or method
+    //     used without an explicit `this.`). MQL5 allows it; resolve to a
+    //     `this.NAME` member so the emitter produces `this.x` / `this.calc()`.
+    if (this.currentClass) {
+      const fieldType = this.currentClass.fields.get(name);
+      if (fieldType !== undefined) {
+        return this.makeThisMember(name, fieldType);
+      }
+      if (this.currentClass.methods.has(name)) {
+        // A bare method reference (only meaningful when immediately called).
+        // Lower to `this.NAME` member; lowerCall classifies the surrounding call.
+        return this.makeThisMember(name, T.unknown);
+      }
     }
     // 3. enum member (unqualified)
     if (this.enumMemberToEnum.has(name)) {
@@ -616,7 +865,37 @@ class Lowerer {
 
   private lowerMember(e: MemberAccess, scope: Scope): IRExpr {
     const object = this.lowerExpr(e.object, scope);
-    return { kind: 'Member', object, member: e.member, type: T.unknown };
+    // If the object is a user-class instance, give the member its declared field
+    // type (so e.g. `obj.x` in arithmetic classifies correctly). Otherwise leave
+    // it `unknown` (the emitter prints `obj.member` regardless).
+    const memberType = this.memberFieldType(object, e.member);
+    return { kind: 'Member', object, member: e.member, type: memberType };
+  }
+
+  /** `this.NAME` member ref for an implicit-this field/method reference. */
+  private makeThisMember(name: string, type: IRType): IRExpr {
+    const thisType: IRType = this.currentClass
+      ? { named: this.currentClass.name, pointer: true }
+      : T.unknown;
+    const object: IRExpr = { kind: 'Ref', binding: { kind: 'thisRef' }, type: thisType };
+    return { kind: 'Member', object, member: name, type };
+  }
+
+  /** Declared type of `object.member` when `object` is a known user-class. */
+  private memberFieldType(object: IRExpr, member: string): IRType {
+    const typeName = this.exprTypeName(object);
+    if (typeName && this.userClassDecls.has(typeName)) {
+      const fields = this.collectClassFieldTypes(typeName);
+      const ft = fields.get(member);
+      if (ft !== undefined) return ft;
+    }
+    return T.unknown;
+  }
+
+  /** The named type of an expression's value (class/struct name), if known. */
+  private exprTypeName(e: IRExpr): string | undefined {
+    const t = this.exprType(e);
+    return t.named;
   }
 
   private lowerBinary(e: BinaryExpr, scope: Scope): IRExpr {
@@ -649,6 +928,27 @@ class Lowerer {
         const target: IRCallTarget = { kind: 'user', name: fname };
         const isAsync = this.funcAsync.get(fname) ?? false;
         return this.makeCall(target, args, isAsync, this.userReturnType(fname));
+      }
+
+      // implicit-`this` method call inside a user-class method: a bare
+      // `method(args)` where `method` is own-or-inherited on the current class
+      // → `this.method(args)` (MQL5 allows the implicit `this`). Lowered as a
+      // user-class method call so it joins the async fixpoint.
+      if (this.currentClass && this.currentClass.methods.has(fname)) {
+        const owner = this.findMethodOwner(this.currentClass.name, fname);
+        if (owner) {
+          const key = `${owner.className}.${fname}`;
+          const isAsync = this.methodAsync.get(key) ?? false;
+          const receiver: IRExpr = {
+            kind: 'Ref',
+            binding: { kind: 'thisRef' },
+            type: { named: this.currentClass.name, pointer: true },
+          };
+          const target: IRCallTarget = { kind: 'method', receiver, method: fname, info: undefined };
+          const call = this.makeCall(target, args, isAsync, this.mapType(owner.decl.returnType));
+          this.methodCallKey.set(call, key);
+          return call;
+        }
       }
 
       // intrinsic free function?
@@ -689,7 +989,8 @@ class Lowerer {
     if (e.callee.kind === 'MemberAccess') {
       const member = e.callee.member;
       const receiver = this.lowerExpr(e.callee.object, scope);
-      const receiverTypeName = this.receiverTypeName(e.callee.object, scope);
+      const receiverTypeName =
+        this.receiverTypeName(e.callee.object, scope) ?? this.exprTypeName(receiver);
 
       let info: ReturnType<typeof lookupCTradeMethod> | undefined;
       if (receiverTypeName && isStdlibClass(receiverTypeName)) {
@@ -714,11 +1015,46 @@ class Lowerer {
             });
           }
         }
+        const isAsync = info?.isAsync ?? false;
+        const target: IRCallTarget = { kind: 'method', receiver, method: member, info };
+        return this.makeCall(target, args, isAsync, info ? this.ctradeReturnType(member) : T.unknown);
       }
 
-      const isAsync = info?.isAsync ?? false;
-      const target: IRCallTarget = { kind: 'method', receiver, method: member, info };
-      return this.makeCall(target, args, isAsync, info ? this.ctradeReturnType(member) : T.unknown);
+      // ── user-class method call (obj.method / this.method) ──
+      // Resolve through single inheritance; async-ness comes from the same
+      // fixpoint as free functions (a method that transitively trades is async).
+      if (receiverTypeName && this.userClassDecls.has(receiverTypeName)) {
+        const owner = this.findMethodOwner(receiverTypeName, member);
+        if (owner) {
+          const key = `${owner.className}.${member}`;
+          const isAsync = this.methodAsync.get(key) ?? false;
+          const target: IRCallTarget = { kind: 'method', receiver, method: member, info: undefined };
+          const call = this.makeCall(target, args, isAsync, this.mapType(owner.decl.returnType));
+          this.methodCallKey.set(call, key);
+          return call;
+        }
+        // Unknown method on a known user class: be loud (§21) — it would throw.
+        this.report({
+          severity: 'error',
+          code: 'MQL_UNKNOWN_METHOD',
+          message:
+            `Unknown method '${receiverTypeName}.${member}(...)': '${receiverTypeName}' ` +
+            `has no such method (own or inherited). It would throw at run time.`,
+          span: e.callee.span,
+          symbol: `${receiverTypeName}.${member}`,
+        });
+        const target: IRCallTarget = { kind: 'method', receiver, method: member, info: undefined };
+        return this.makeCall(target, args, false, T.unknown);
+      }
+
+      // ── method on an unknown/runtime-struct/foreign receiver ──
+      // We don't know the receiver's method set (a runtime struct, a forwarded
+      // value, a template type param), so we emit the call verbatim and stay
+      // SYNC. (Trading paths go through CTrade or the OrderSend intrinsic, both
+      // classified above/as free intrinsics — so an unclassified method call is
+      // never a missed-await on the trade path.)
+      const target: IRCallTarget = { kind: 'method', receiver, method: member, info: undefined };
+      return this.makeCall(target, args, false, T.unknown);
     }
 
     // ── any other callee shape (e.g. (expr)(...) or A::b(...)) ──
@@ -743,11 +1079,33 @@ class Lowerer {
   /** Determine the declared stdlib/user type name of a method-call receiver. */
   private receiverTypeName(objExpr: Expr, scope: Scope): string | undefined {
     if (objExpr.kind === 'Identifier') {
+      // `this` inside a method → the enclosing class.
+      if (objExpr.name === 'this') return this.currentClass?.name;
       const sym = scope.resolve(objExpr.name);
       const type = sym?.type ?? this.varTypes.get(objExpr.name);
       if (type) return this.typeName(type);
     }
-    // new CTrade()/this/other — try lowering and reading the type name.
+    // new CTrade()/chained member — try lowering and reading the type name
+    // (handled by the caller via exprTypeName on the lowered receiver).
+    return undefined;
+  }
+
+  /**
+   * Walk the single-inheritance chain from `className` to find the class that
+   * declares `method`; returns {className, decl} or undefined.
+   */
+  private findMethodOwner(
+    className: string,
+    method: string,
+  ): { className: string; decl: FunctionDecl } | undefined {
+    let cur: string | undefined = className;
+    const seen = new Set<string>();
+    while (cur && this.userClassDecls.has(cur) && !seen.has(cur)) {
+      seen.add(cur);
+      const m = this.classMethods.get(cur)?.get(method);
+      if (m) return { className: cur, decl: m };
+      cur = this.userClassDecls.get(cur)!.base;
+    }
     return undefined;
   }
 
@@ -772,6 +1130,19 @@ class Lowerer {
           changed = true;
         }
       }
+      // User-class methods participate in the SAME fixpoint: a method becomes
+      // async if its body references an async callee (intrinsic-async, an async
+      // free function, or an async sibling/own method).
+      for (const cls of this.classes) {
+        for (const m of cls.methods) {
+          const key = `${cls.name}.${m.name}`;
+          if (this.methodAsync.get(key)) continue; // already async
+          if (this.blockReferencesAsyncCallee(m.body)) {
+            this.methodAsync.set(key, true);
+            changed = true;
+          }
+        }
+      }
     }
   }
 
@@ -785,6 +1156,12 @@ class Lowerer {
     if (call.target.kind === 'user') {
       return this.funcAsync.get(call.target.name) ?? false;
     }
+    // A user-class method call: resolve its async-ness against the live
+    // methodAsync map (the IRCall→key side-table records the owning method).
+    const key = this.methodCallKey.get(call);
+    if (key !== undefined) {
+      return this.methodAsync.get(key) ?? false;
+    }
     return false;
   }
 
@@ -794,6 +1171,12 @@ class Lowerer {
       if (call.target.kind === 'user') {
         const a = this.funcAsync.get(call.target.name);
         if (a) call.isAsync = true;
+        return;
+      }
+      // User-class method calls: pick up the converged method async-ness.
+      const key = this.methodCallKey.get(call);
+      if (key !== undefined && this.methodAsync.get(key)) {
+        call.isAsync = true;
       }
     });
   }

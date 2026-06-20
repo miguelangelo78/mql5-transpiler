@@ -22,6 +22,12 @@
 
 import type { IBroker, IMarketFeed, IClock } from './providers/types';
 import type { MqlConst } from './constants';
+import type {
+  MqlTradeRequest,
+  MqlTradeResult,
+  MqlTradeCheckResult,
+  MqlTradeTransaction,
+} from './mqlStructs';
 
 /** MT5 `CTrade` Standard-Library class (subset). Trade ops are async. */
 export interface ICTrade {
@@ -30,12 +36,20 @@ export interface ICTrade {
   SetDeviationInPoints(points: number): void;
   SetTypeFilling(filling: number): void;
   LogLevel(level: number): void;
+  /** Set the fill policy from the symbol's allowed filling modes (config). */
+  SetTypeFillingBySymbol(symbol: string): boolean;
+  /** Set the account margin mode (config; no effect on the netting backtest). */
+  SetMarginMode(mode?: number): void;
+  /** Enable/disable async order sending (config; backtest fills synchronously). */
+  SetAsyncMode(async: boolean): void;
 
   // trading (async — broker I/O)
   Buy(volume: number, symbol?: string, price?: number, sl?: number, tp?: number, comment?: string): Promise<boolean>;
   Sell(volume: number, symbol?: string, price?: number, sl?: number, tp?: number, comment?: string): Promise<boolean>;
   PositionClose(symbolOrTicket: string | number, deviation?: number): Promise<boolean>;
   PositionModify(symbolOrTicket: string | number, sl: number, tp: number): Promise<boolean>;
+  /** Open a market position of `orderType` (ORDER_TYPE_BUY/SELL). */
+  PositionOpen(symbol: string, orderType: number, volume: number, price?: number, sl?: number, tp?: number, comment?: string): Promise<boolean>;
 
   // pending orders (async — broker I/O). Optional: a runtime built over an
   // egress that doesn't support pending orders may omit these; CTrade reports
@@ -45,6 +59,8 @@ export interface ICTrade {
   BuyStop?(volume: number, price: number, symbol?: string, sl?: number, tp?: number, comment?: string): Promise<boolean>;
   SellStop?(volume: number, price: number, symbol?: string, sl?: number, tp?: number, comment?: string): Promise<boolean>;
   OrderDelete?(ticket: number): Promise<boolean>;
+  /** Modify a RESTING pending order's price/SL/TP by ticket. */
+  OrderModify?(ticket: number, price: number, sl: number, tp: number, typeTime?: number, expiration?: number, stoplimit?: number): Promise<boolean>;
 
   // last-result accessors (sync)
   ResultRetcode(): number;
@@ -53,9 +69,28 @@ export interface ICTrade {
   ResultOrder(): number;
   ResultVolume(): number;
   ResultPrice(): number;
+  /** Last result's requote bid/ask (not carried by the boundary → 0; §21). */
+  ResultBid(): number;
+  ResultAsk(): number;
+  /** The broker comment on the last result. */
+  ResultComment(): string;
+  /** The retcode of the last OrderCheck (no separate check cache → last trade). */
+  CheckResultRetcode(): number;
+  /** The magic number currently configured. */
+  RequestMagic(): number;
 }
 
 export type CTradeCtor = new (rt: Runtime) => ICTrade;
+
+/**
+ * Constructors for MQL5's builtin trade-API structs (`new rt.MqlTradeRequest()`,
+ * etc.). Unlike CTrade these take NO `rt` arg — a bare MQL5 declaration
+ * `MqlTradeRequest req;` zero-inits a fresh value struct (see ./mqlStructs.ts).
+ */
+export type MqlTradeRequestCtor = new () => MqlTradeRequest;
+export type MqlTradeResultCtor = new () => MqlTradeResult;
+export type MqlTradeCheckResultCtor = new () => MqlTradeCheckResult;
+export type MqlTradeTransactionCtor = new () => MqlTradeTransaction;
 
 /** The non-constant part of the runtime surface. */
 export interface RuntimeApi {
@@ -94,6 +129,14 @@ export interface RuntimeApi {
   iADX(symbol: string, timeframe: number, period: number): number;
   iCCI(symbol: string, timeframe: number, period: number, appliedPrice: number): number;
   iMomentum(symbol: string, timeframe: number, period: number, appliedPrice: number): number;
+  /**
+   * iCustom — run a SOURCE custom indicator (.mq5) and return a handle (>=0) or
+   * INVALID_HANDLE (-1). The trailing params become the indicator's `input`s in
+   * declaration order. CopyBuffer(handle, ...) reads its output buffers exactly
+   * like a native-indicator handle. Sync (the indicator is recomputed locally
+   * from feed bars — no I/O). See ./indicators/icustom.ts.
+   */
+  iCustom(symbol: string, timeframe: number, name: string, ...params: (number | boolean | string)[]): number;
   CopyBuffer(handle: number, bufferNum: number, startPos: number, count: number, dest: number[]): number;
   IndicatorRelease(handle: number): boolean;
 
@@ -168,6 +211,15 @@ export interface RuntimeApi {
   SymbolInfoTick(symbol: string, tick: unknown): boolean;
   SymbolSelect(symbol: string, enable: boolean): boolean;
 
+  // ── raw trade API (broker I/O — async) ──
+  /**
+   * OrderSend — MQL5's low-level trade primitive. Dispatches on `request.action`
+   * (TRADE_ACTION_*), performs the matching broker op, FILLS `result` IN PLACE
+   * (retcode/deal/order/volume/price/comment), and returns
+   * `result.retcode === TRADE_RETCODE_DONE`. Async on our providers (real I/O).
+   */
+  OrderSend(request: MqlTradeRequest, result: MqlTradeResult): Promise<boolean>;
+
   // ── time (sync) ──
   TimeCurrent(): number;
   TimeLocal(): number;
@@ -215,6 +267,13 @@ export interface RuntimeApi {
 
   // ── Standard-Library classes ──
   readonly CTrade: CTradeCtor;
+
+  // ── builtin trade-API struct constructors (`new rt.MqlTradeRequest()` — no
+  //    `rt` arg; a bare MQL5 `MqlTradeRequest req;` zero-inits a value struct) ──
+  readonly MqlTradeRequest: MqlTradeRequestCtor;
+  readonly MqlTradeResult: MqlTradeResultCtor;
+  readonly MqlTradeCheckResult: MqlTradeCheckResultCtor;
+  readonly MqlTradeTransaction: MqlTradeTransactionCtor;
 }
 
 /** The complete runtime surface seen by transpiled programs. */

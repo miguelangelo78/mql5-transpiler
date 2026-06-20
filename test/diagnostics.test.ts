@@ -136,11 +136,11 @@ describe('diagnostics — the BAD fixture trips all three fatal findings', () =>
     const d = coverage.find((x) => x.code === 'MQL_UNIMPLEMENTED_BUILTIN');
     expect(d).toBeDefined();
     expect(d!.severity).toBe('error');
-    // iCustom is the honest remainder — custom-indicator transpilation is out
-    // of PoC scope, so it has no handle ctor on the runtime. (iBands USED to be
-    // the probe here but is now a REAL implementation — see the "implemented
-    // indicators are covered" test below, which pins iBands/iMACD/iStochastic.)
-    expect(d!.symbol).toBe('iCustom');
+    // OrderCheck is the honest remainder — it needs a margin/profit projection
+    // the provider boundary doesn't expose, so it stays unimplemented (faking
+    // one would violate §21). (iCustom USED to be the probe here but is now a
+    // REAL implementation — see the "iCustom is covered" test below.)
+    expect(d!.symbol).toBe('OrderCheck');
   });
 
   it('hasErrors() is true for the bad fixture (fatal policy gate)', () => {
@@ -150,18 +150,19 @@ describe('diagnostics — the BAD fixture trips all three fatal findings', () =>
 });
 
 describe('checkCoverage — recognised-but-unimplemented builtin enumeration', () => {
-  it('flags the still-unimplemented builtin (iCustom) when used', () => {
-    // iCustom is the honest remainder: custom-indicator transpilation is out of
-    // PoC scope, so it has NO handle constructor on the runtime and must be
-    // flagged (not silently shipped). NOTE: iMACD / iStochastic / iBands / iADX /
-    // iCCI / iMomentum USED to be flagged here but are now REAL implementations
-    // (IndicatorRegistry, MT5-source-faithful), so they are no longer flagged —
-    // see the "does NOT flag implemented builtins" test below, which pins them
-    // as covered.
+  it('flags the still-unimplemented builtin (OrderCheck) when used', () => {
+    // OrderCheck is the honest remainder: it needs a margin/profit projection
+    // the provider boundary doesn't expose, so it has NO real impl on the
+    // runtime and must be flagged (not silently shipped). NOTE: iCustom USED to
+    // be the probe here but is now a REAL implementation (CustomIndicatorRegistry
+    // compiles + runs a SOURCE .mq5 custom indicator), so it is no longer
+    // flagged — see the "iCustom is covered" test below.
     const src = `
 int OnInit()
   {
-   int c = iCustom(_Symbol, _Period, "MyIndicator", 14);
+   MqlTradeRequest req;
+   MqlTradeCheckResult check;
+   bool ok = OrderCheck(req, check);
    return(INIT_SUCCEEDED);
   }
 `;
@@ -171,7 +172,23 @@ int OnInit()
       .filter((d) => d.code === 'MQL_UNIMPLEMENTED_BUILTIN')
       .map((d) => d.symbol)
       .sort();
-    expect(symbols).toEqual(['iCustom']);
+    expect(symbols).toEqual(['OrderCheck']);
+  });
+
+  it('does NOT flag iCustom (now a REAL custom-indicator implementation)', () => {
+    // iCustom gained a real implementation this cycle: CustomIndicatorRegistry
+    // compiles a SOURCE .mq5 custom indicator with the same frontend+backend and
+    // CopyBuffer reads its output buffers. It must no longer be flagged.
+    const src = `
+int OnInit()
+  {
+   int c = iCustom(_Symbol, _Period, "MyIndicator", 14);
+   return(INIT_SUCCEEDED);
+  }
+`;
+    const mod = compileMql5ToIR(src, { name: 'icustomCovered' });
+    const coverage = checkCoverage(mod);
+    expect(coverage, JSON.stringify(coverage, null, 2)).toHaveLength(0);
   });
 
   it('does NOT flag the indicators implemented this cycle (iMACD/iBands/iStochastic/iADX/iCCI/iMomentum)', () => {
@@ -245,32 +262,35 @@ int OnInit()
     expect(coverage, JSON.stringify(coverage, null, 2)).toHaveLength(0);
   });
 
-  it('flags a still-unimplemented CTrade method (OrderModify) when used', () => {
-    // OrderModify is recognised by the intrinsic table but NOT implemented on the
-    // CTrade class — it must be flagged. (BuyLimit USED to be flagged here but is
-    // now a real implementation routing to the pending-order book — see the
-    // "does NOT flag implemented builtins" test below, which pins it as covered.)
+  it('flags a still-unimplemented CTrade method (OrderOpen) when used', () => {
+    // OrderOpen (the pending-OPEN variant) is recognised by the intrinsic table
+    // but NOT implemented on the CTrade class — it must be flagged. (OrderModify
+    // USED to be flagged here but is now a real implementation routing to
+    // broker.modifyPendingOrder — see the "does NOT flag implemented builtins"
+    // test below, which pins PositionOpen/OrderModify as covered.)
     const src = `
 #include <Trade/Trade.mqh>
 CTrade trade;
 int OnInit()
   {
-   trade.OrderModify(12345, 1.10, 1.09, 1.12, ORDER_TIME_GTC, 0);
+   trade.OrderOpen(_Symbol, ORDER_TYPE_BUY_LIMIT, 0.1, 1.05, 1.10, 1.00, 1.20);
    return(INIT_SUCCEEDED);
   }
 `;
     const mod = compileMql5ToIR(src, { name: 'ctradegap' });
     const coverage = checkCoverage(mod);
-    const d = coverage.find((x) => x.symbol === 'CTrade.OrderModify');
+    const d = coverage.find((x) => x.symbol === 'CTrade.OrderOpen');
     expect(d).toBeDefined();
     expect(d!.code).toBe('MQL_UNIMPLEMENTED_BUILTIN');
   });
 
   it('does NOT flag implemented builtins / CTrade methods / context vars', () => {
-    // Covers the builtins/methods made REAL this cycle: iRSI, iATR,
-    // EventSetTimer/EventKillTimer, and CTrade.BuyLimit/SellLimit/OrderDelete —
-    // alongside the previously-covered iMA / trade.Buy / context vars. None must
-    // be flagged now that they are genuine implementations.
+    // Covers the builtins/methods made REAL this cycle: the raw trade API
+    // (OrderSend + the MqlTradeRequest/MqlTradeResult structs), iCustom, and the
+    // CTrade completions (PositionOpen / OrderModify / config setters / extra
+    // Result* accessors) — alongside the previously-covered iMA / iRSI / iATR /
+    // EventSetTimer / trade.Buy / BuyLimit / OrderDelete / context vars. None
+    // must be flagged now that they are genuine implementations.
     const src = `
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -279,11 +299,33 @@ int OnInit()
    int h  = iMA(_Symbol, _Period, 10, 0, MODE_SMA, PRICE_CLOSE);
    int hr = iRSI(_Symbol, _Period, 14, PRICE_CLOSE);
    int ha = iATR(_Symbol, _Period, 14);
+   int hc = iCustom(_Symbol, _Period, "MyIndicator", 14);
    EventSetTimer(60);
+
+   // raw trade API — structs + OrderSend
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   req.action = TRADE_ACTION_DEAL;
+   req.type   = ORDER_TYPE_BUY;
+   req.symbol = _Symbol;
+   req.volume = 0.1;
+   OrderSend(req, res);
+
+   // CTrade completions
+   trade.SetTypeFillingBySymbol(_Symbol);
+   trade.SetMarginMode();
+   trade.SetAsyncMode(false);
+   trade.PositionOpen(_Symbol, ORDER_TYPE_BUY, 0.1, 0.0, 0.0, 0.0, "");
    trade.Buy(0.1, _Symbol);
    trade.BuyLimit(0.1, 1.10, _Symbol);
    trade.SellLimit(0.1, 1.12, _Symbol);
    trade.OrderDelete(12345);
+   trade.OrderModify(12345, 1.10, 1.09, 1.12, ORDER_TIME_GTC, 0);
+   double rb = trade.ResultBid();
+   double ra = trade.ResultAsk();
+   string rc = trade.ResultComment();
+   int    cr = trade.CheckResultRetcode();
+   long   rm = trade.RequestMagic();
    EventKillTimer();
    Print(_Digits, _Point);
    return(INIT_SUCCEEDED);

@@ -141,10 +141,32 @@ export const MQL_CONST = {
   ORDER_TIME_SPECIFIED: 2,
   ORDER_TIME_SPECIFIED_DAY: 3,
 
+  // ── ENUM_ORDER_TYPE_FILLING (known-correct documented values) ──
+  ORDER_FILLING_FOK: 0, // Fill-Or-Kill
+  ORDER_FILLING_IOC: 1, // Immediate-Or-Cancel
+  ORDER_FILLING_RETURN: 2, // Return (remainder stays as a pending order)
+
+  // ── ENUM_TRADE_REQUEST_ACTIONS (canonical, documented MQL5 values) ──
+  // The `action` field of MqlTradeRequest, dispatched on by OrderSend
+  // (./orderSend.ts) LOCALLY — nothing goes on a wire, so any self-consistent
+  // collision-free assignment is correct, but these ARE the documented MT5 ids
+  // so a transpiled EA's `req.action = TRADE_ACTION_DEAL` resolves to the value
+  // orderSend.ts dispatches on. (orderSend.ts must mirror these.)
+  TRADE_ACTION_DEAL: 1, // place a market order (immediate execution)
+  TRADE_ACTION_PENDING: 5, // place a pending order
+  TRADE_ACTION_SLTP: 6, // modify an open position's SL/TP
+  TRADE_ACTION_MODIFY: 7, // modify a pending order's params
+  TRADE_ACTION_REMOVE: 8, // delete a pending order
+  TRADE_ACTION_CLOSE_BY: 10, // close a position by an opposite one
+
   // ── TRADE_RETCODE (subset) ──
   TRADE_RETCODE_DONE: 10009,
   TRADE_RETCODE_REQUOTE: 10004,
   TRADE_RETCODE_REJECT: 10006,
+  // The §21 honest-reject code OrderSend / CTrade use when an egress cannot
+  // service a request (e.g. a missing optional pending-order primitive). A
+  // local literal in orderSend.ts/ctrade.ts; exposed here so an EA can compare.
+  TRADE_RETCODE_INVALID: 10013,
 
   // ── ENUM_SERIESMODE (iHighest/iLowest `type`) — CANONICAL MQL5 values ──
   // These ARE the documented MQL5 ids (MODE_OPEN=0 … MODE_REAL_VOLUME=5) and

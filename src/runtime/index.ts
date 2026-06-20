@@ -22,8 +22,24 @@
 import { MQL_CONST, type MqlConst } from './constants';
 import type { Providers } from './providers/types';
 import type { RuntimeContext } from '../engine/types';
-import type { Runtime, RuntimeApi, CTradeCtor } from './runtime';
+import type {
+  Runtime,
+  RuntimeApi,
+  CTradeCtor,
+  MqlTradeRequestCtor,
+  MqlTradeResultCtor,
+  MqlTradeCheckResultCtor,
+  MqlTradeTransactionCtor,
+} from './runtime';
 import { IndicatorRegistry } from './indicators/registry';
+import { CustomIndicatorRegistry, CUSTOM_HANDLE_BASE } from './indicators/icustom';
+import {
+  MqlTradeRequest,
+  MqlTradeResult,
+  MqlTradeCheckResult,
+  MqlTradeTransaction,
+} from './mqlStructs';
+import { orderSend } from './orderSend';
 import {
   ArraySeriesRegistry,
   arrayResize,
@@ -133,14 +149,32 @@ class RuntimeImpl implements RuntimeApi {
   // helper subsystems
   private readonly seriesReg: ArraySeriesRegistry;
   private readonly indicators: IndicatorRegistry;
+  private readonly customIndicators: CustomIndicatorRegistry;
   private readonly positionsState: PositionState;
   private readonly ordersState: OrderState;
   private readonly historyState: HistoryState;
   private readonly C: MqlConst;
 
-  readonly CTrade: CTradeCtor;
+  // Monotonic handle counter for custom indicators, OFFSET by CUSTOM_HANDLE_BASE
+  // so iCustom handles occupy a numeric range DISJOINT from the native
+  // IndicatorRegistry's 0-based handles. `owns()`-based routing (in CopyBuffer /
+  // IndicatorRelease) is correct either way; a disjoint range removes any doubt.
+  private customHandleCounter = 0;
 
-  constructor(providers: Providers, ctx: RuntimeContext, C: MqlConst) {
+  readonly CTrade: CTradeCtor;
+  // Builtin trade-API struct constructors (assigned as the CLASSES, not
+  // instances): `new rt.MqlTradeRequest()` zero-inits a fresh value struct.
+  readonly MqlTradeRequest: MqlTradeRequestCtor = MqlTradeRequest;
+  readonly MqlTradeResult: MqlTradeResultCtor = MqlTradeResult;
+  readonly MqlTradeCheckResult: MqlTradeCheckResultCtor = MqlTradeCheckResult;
+  readonly MqlTradeTransaction: MqlTradeTransactionCtor = MqlTradeTransaction;
+
+  constructor(
+    providers: Providers,
+    ctx: RuntimeContext,
+    C: MqlConst,
+    indicatorsDir?: string,
+  ) {
     this.broker = providers.broker;
     this.feed = providers.feed;
     this.clock = providers.clock;
@@ -154,6 +188,13 @@ class RuntimeImpl implements RuntimeApi {
 
     this.seriesReg = new ArraySeriesRegistry();
     this.indicators = new IndicatorRegistry(providers.feed, this.seriesReg);
+    this.customIndicators = new CustomIndicatorRegistry(
+      providers.feed,
+      this.seriesReg,
+      ctx,
+      () => CUSTOM_HANDLE_BASE + this.customHandleCounter++,
+      indicatorsDir,
+    );
     this.positionsState = new PositionState(providers.broker, C);
     this.ordersState = new OrderState(providers.broker);
     this.historyState = new HistoryState(providers.broker);
@@ -250,6 +291,14 @@ class RuntimeImpl implements RuntimeApi {
   iMomentum(symbol: string, timeframe: number, period: number, appliedPrice: number): number {
     return this.indicators.iMomentum(symbol, timeframe, period, appliedPrice);
   }
+  iCustom(
+    symbol: string,
+    timeframe: number,
+    name: string,
+    ...params: (number | boolean | string)[]
+  ): number {
+    return this.customIndicators.iCustom(symbol, timeframe, name, ...params);
+  }
   CopyBuffer(
     handle: number,
     bufferNum: number,
@@ -257,9 +306,17 @@ class RuntimeImpl implements RuntimeApi {
     count: number,
     dest: number[],
   ): number {
+    // Route by handle ownership: a handle minted by iCustom reads from the
+    // custom-indicator registry; everything else from the native registry.
+    if (this.customIndicators.owns(handle)) {
+      return this.customIndicators.copyBuffer(handle, bufferNum, startPos, count, dest);
+    }
     return this.indicators.copyBuffer(handle, bufferNum, startPos, count, dest);
   }
   IndicatorRelease(handle: number): boolean {
+    if (this.customIndicators.owns(handle)) {
+      return this.customIndicators.release(handle);
+    }
     return this.indicators.release(handle);
   }
 
@@ -580,6 +637,16 @@ class RuntimeImpl implements RuntimeApi {
     return symbolSelect(this.feed, symbol, enable);
   }
 
+  // ── raw trade API (broker I/O — async) ──
+  /**
+   * OrderSend — forward to the orderSend module bound to this runtime's broker.
+   * It dispatches on `request.action`, performs the broker op, and mutates
+   * `result` in place (see ./orderSend.ts). Returns retcode === DONE.
+   */
+  OrderSend(request: MqlTradeRequest, result: MqlTradeResult): Promise<boolean> {
+    return orderSend(this.broker, request, result);
+  }
+
   // ── timer (host) ──
   /**
    * MT5 EventSetTimer(seconds): start the OnTimer timer. Returns true on
@@ -748,12 +815,26 @@ class RuntimeImpl implements RuntimeApi {
   }
 }
 
+/** Options for createRuntime (all optional; additive). */
+export interface CreateRuntimeOptions {
+  /**
+   * Directory `iCustom("<name>")` resolves `<name>.mq5` against. When omitted,
+   * the custom-indicator compiler uses its default (`examples/indicators`). An
+   * absolute/relative `.mq5` path in the `name` arg is also accepted directly.
+   */
+  indicatorsDir?: string;
+}
+
 /**
  * Build the full Runtime: a RuntimeImpl with the constants table merged on.
  * The constants are own-enumerable data props so `rt.MODE_SMA` resolves.
  */
-export function createRuntime(providers: Providers, ctx: RuntimeContext): Runtime {
-  const impl = new RuntimeImpl(providers, ctx, MQL_CONST);
+export function createRuntime(
+  providers: Providers,
+  ctx: RuntimeContext,
+  opts?: CreateRuntimeOptions,
+): Runtime {
+  const impl = new RuntimeImpl(providers, ctx, MQL_CONST, opts?.indicatorsDir);
   // Merge the constants table as own properties (non-enumerable not required;
   // the emitter only reads them). Object.assign copies the const values.
   Object.assign(impl, MQL_CONST);

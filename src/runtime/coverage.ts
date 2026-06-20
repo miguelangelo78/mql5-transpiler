@@ -29,7 +29,12 @@
 
 import type { IRModule } from '../ir/nodes';
 import type { Diagnostic } from '../diagnostics';
-import { lookupFreeIntrinsic, lookupCTradeMethod, isContextVar } from '../sema/intrinsics';
+import {
+  lookupFreeIntrinsic,
+  lookupCTradeMethod,
+  isContextVar,
+  isRuntimeStruct,
+} from '../sema/intrinsics';
 
 /**
  * Free-function builtins that `RuntimeImpl` (./index.ts) implements for real —
@@ -59,10 +64,20 @@ import { lookupFreeIntrinsic, lookupCTradeMethod, isContextVar } from '../sema/i
  * Previously made real: iRSI, iATR (Wilder RSI / MT5 SMA-of-True-Range);
  * EventSetTimer/EventSetMillisecondTimer/EventKillTimer (engine-driven cadence).
  *
+ * NOW IMPLEMENTED this cycle (moved OUT of the excluded set):
+ *   - iCustom     → SOURCE custom-indicator transpilation (CustomIndicatorRegistry;
+ *                   compiles <name>.mq5 with the same frontend+backend, runs its
+ *                   OnCalculate, CopyBuffer reads its buffers with as-series /
+ *                   warm-up semantics identical to a native handle).
+ *   - OrderSend   → the raw trade primitive over IBroker (mutates the result
+ *                   struct in place; §21 honest reject on an unserviceable action).
+ *
  * EXCLUDED on purpose (recognised in the intrinsic table but NOT implemented),
  * so a program using one is flagged rather than silently shipped:
- *   - iCustom               → custom-indicator transpilation is out of PoC scope
- *                             (no handle ctor on RuntimeApi). The honest remainder.
+ *   - OrderCheck / OrderCalcMargin / OrderCalcProfit
+ *                 → need a margin/profit projection the provider boundary does
+ *                   not expose (no per-symbol margin-rate on IBroker); faking a
+ *                   projection would violate §21. The honest remainder.
  *
  * NOTE on "honest-partial" methods (AccountInfoString, SymbolInfoString,
  * OrderGetDouble(ORDER_PRICE_CURRENT)): the method IS a real implementation and
@@ -85,6 +100,7 @@ const RUNTIME_FREE_BUILTINS: ReadonlySet<string> = new Set<string>([
   'iADX',
   'iCCI',
   'iMomentum',
+  'iCustom',
   'CopyBuffer',
   'IndicatorRelease',
   // timer / events (real — engine-driven OnTimer cadence)
@@ -155,6 +171,10 @@ const RUNTIME_FREE_BUILTINS: ReadonlySet<string> = new Set<string>([
   'SymbolInfoString',
   'SymbolInfoTick',
   'SymbolSelect',
+  // raw trade API (real — OrderSend over the IBroker boundary; mutates the
+  // result struct in place, §21 honest reject on an egress that can't service
+  // an action). OrderCheck/OrderCalcMargin/OrderCalcProfit stay EXCLUDED below.
+  'OrderSend',
   // time (real)
   'TimeCurrent',
   'TimeLocal',
@@ -201,16 +221,34 @@ const RUNTIME_FREE_BUILTINS: ReadonlySet<string> = new Set<string>([
 /**
  * CTrade methods that `CTrade` (./ctrade.ts) implements for real.
  *
- * NOW IMPLEMENTED (real, listed below — moved OUT of the excluded set):
- *   BuyLimit, SellLimit, BuyStop, SellStop, OrderDelete → real (ctrade.ts;
- *   route to the optional IBroker pending methods, with a §21 honest guard that
- *   fails loudly — retcode 10013 — on an egress lacking pending support; the
- *   backtest provider implements them).
+ * NOW IMPLEMENTED this cycle (real, listed below — moved OUT of the excluded set,
+ * each verified non-stub in ctrade.ts):
+ *   PositionOpen        → routes ORDER_TYPE_BUY/SELL to placeMarketOrder
+ *                         (§21 honest reject on a non-market order type)
+ *   OrderModify         → modifies a resting pending via broker.modifyPendingOrder
+ *                         (§21 honest guard on an egress lacking it)
+ *   SetTypeFillingBySymbol / SetMarginMode / SetAsyncMode
+ *                       → config setters (stored; documented no-op on the
+ *                         deterministic backtest engine — accepted, never faked)
+ *   ResultBid / ResultAsk → return 0 (the boundary's TradeResult carries no
+ *                         requote bid/ask; honest "not carried", not fabricated)
+ *   ResultComment / CheckResultRetcode / RequestMagic → real last-result reads
  *
- * EXCLUDED (recognised in CTRADE_METHODS but NOT implemented on the class):
- *   PositionOpen, OrderOpen, OrderModify, SetTypeFillingBySymbol, SetMarginMode,
- *   SetAsyncMode, ResultBid, ResultAsk, ResultComment, CheckResultRetcode,
- *   RequestMagic.
+ * Previously made real: BuyLimit/SellLimit/BuyStop/SellStop/OrderDelete (route
+ * to the optional IBroker pending methods, §21 honest guard — retcode 10013 —
+ * on an egress lacking pending support; the backtest provider implements them).
+ *
+ * EXCLUDED (recognised in CTRADE_METHODS but NOT implemented on the class), so a
+ * program using one is flagged rather than silently shipped:
+ *   - OrderOpen → the pending-OPEN variant (vs PositionOpen, the market-open).
+ *     Fold in alongside BuyLimit/etc. when needed. The honest remainder here.
+ *
+ * NOTE on the config setters + ResultBid/ResultAsk: these ARE real
+ * implementations (present, non-stub) that honestly do what the boundary
+ * permits — the setters store + accept (documented no-op on backtest fills),
+ * ResultBid/ResultAsk return the §21 "not carried" 0. That is the same
+ * honest-partial pattern as AccountInfoString below; the method is present, so
+ * it is covered.
  */
 const RUNTIME_CTRADE_METHODS: ReadonlySet<string> = new Set<string>([
   // trading (real)
@@ -218,6 +256,7 @@ const RUNTIME_CTRADE_METHODS: ReadonlySet<string> = new Set<string>([
   'Sell',
   'PositionClose',
   'PositionModify',
+  'PositionOpen',
   // pending orders (real — rest in the backtest book; §21 honest guard on
   // egresses that lack the optional IBroker pending methods)
   'BuyLimit',
@@ -225,10 +264,14 @@ const RUNTIME_CTRADE_METHODS: ReadonlySet<string> = new Set<string>([
   'BuyStop',
   'SellStop',
   'OrderDelete',
+  'OrderModify',
   // configuration (real)
   'SetExpertMagicNumber',
   'SetDeviationInPoints',
   'SetTypeFilling',
+  'SetTypeFillingBySymbol',
+  'SetMarginMode',
+  'SetAsyncMode',
   'LogLevel',
   // last-result accessors (real)
   'ResultRetcode',
@@ -237,6 +280,11 @@ const RUNTIME_CTRADE_METHODS: ReadonlySet<string> = new Set<string>([
   'ResultOrder',
   'ResultVolume',
   'ResultPrice',
+  'ResultBid',
+  'ResultAsk',
+  'ResultComment',
+  'CheckResultRetcode',
+  'RequestMagic',
 ]);
 
 /**
@@ -251,6 +299,20 @@ const RUNTIME_CONTEXT_VARS: ReadonlySet<string> = new Set<string>([
   '_Digits',
   '_Point',
   '_LastError',
+]);
+
+/**
+ * Builtin runtime STRUCT classes (`new rt.MqlTradeRequest()` etc.) the runtime
+ * provides for real (assigned as the classes on RuntimeImpl, see ./index.ts).
+ * A used struct name in `usedBuiltins` lowered as a runtime construction; if the
+ * runtime didn't ship the class it would throw at run time, so an unshipped
+ * struct must be flagged. All four ARE shipped this cycle (mqlStructs.ts).
+ */
+const RUNTIME_STRUCTS_PROVIDED: ReadonlySet<string> = new Set<string>([
+  'MqlTradeRequest',
+  'MqlTradeResult',
+  'MqlTradeCheckResult',
+  'MqlTradeTransaction',
 ]);
 
 /**
@@ -312,6 +374,26 @@ export function checkCoverage(mod: IRModule): Diagnostic[] {
 
     // Pseudo-intrinsics: never a coverage finding.
     if (PSEUDO_INTRINSICS.has(used)) continue;
+
+    // Builtin runtime STRUCT (MqlTradeRequest etc.)? It lowered as a runtime
+    // construction `new rt.<Name>()`; flag it only if the runtime didn't ship
+    // the class (it would throw at run time). All four ARE shipped this cycle,
+    // so this never fires today — it guards a future struct added to the
+    // intrinsic table before its class lands on the runtime.
+    if (isRuntimeStruct(used)) {
+      if (!RUNTIME_STRUCTS_PROVIDED.has(used)) {
+        diagnostics.push({
+          severity: 'error',
+          code: 'MQL_UNIMPLEMENTED_BUILTIN',
+          message:
+            `Builtin struct '${used}' is recognised but NOT provided by the ` +
+            `runtime (\`new rt.${used}()\` would throw at run time). Implement ` +
+            `it on the Runtime, or avoid it in the EA.`,
+          symbol: used,
+        });
+      }
+      continue;
+    }
 
     // Context variable?
     if (isContextVar(used)) {

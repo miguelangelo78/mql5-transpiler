@@ -158,6 +158,18 @@ const FREE_INTRINSICS: Record<string, { provider: IntrinsicInfo['provider']; isA
   Alert: { provider: 'host', isAsync: false },
   GetLastError: { provider: 'host', isAsync: false },
   ResetLastError: { provider: 'host', isAsync: false },
+
+  // ── raw trade API (broker I/O — async) ──
+  // OrderSend(request, result) is MQL5's low-level synchronous trade entry; on
+  // our async providers it becomes `await rt.OrderSend(req, res)`. It mutates
+  // `result` in place and returns a bool, exactly like the MT5 builtin.
+  OrderSend: { provider: 'broker', isAsync: true },
+  // OrderCheck(request, check_result) validates a request without sending it.
+  // It hits the (cached) account/symbol state — no real I/O — so it is sync.
+  OrderCheck: { provider: 'broker', isAsync: false },
+  // OrderCalcMargin / OrderCalcProfit are pure local calculations.
+  OrderCalcMargin: { provider: 'broker', isAsync: false },
+  OrderCalcProfit: { provider: 'broker', isAsync: false },
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -230,6 +242,31 @@ export const STDLIB_CLASSES: ReadonlySet<string> = new Set([
   'CiStochastic',
   'CiBands',
 ]);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Runtime-provided builtin STRUCT types (MQL5's trade-API structs).
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Builtin struct types the runtime supplies as classes (`new rt.<Name>()`).
+ * Unlike STDLIB_CLASSES (CTrade et al., constructed `new rt.CTrade(rt, ...)`
+ * with `rt` first), these are plain MQL5 value structs: a bare `MqlTradeRequest
+ * req;` declaration is zero-initialised, which we emit as a fresh instance
+ * `const req = new rt.MqlTradeRequest();` (no `rt` arg). Field assignment
+ * (`req.action = X;`) and reads (`res.retcode`) emit unchanged as TS property
+ * access. The runtime provides these classes + the OrderSend impl next phase.
+ */
+export const RUNTIME_STRUCTS: ReadonlySet<string> = new Set([
+  'MqlTradeRequest',
+  'MqlTradeResult',
+  'MqlTradeCheckResult',
+  'MqlTradeTransaction',
+]);
+
+/** True if `name` is a builtin runtime struct (constructed `new rt.<Name>()`). */
+export function isRuntimeStruct(name: string): boolean {
+  return RUNTIME_STRUCTS.has(name);
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Context variables, builtin constants.

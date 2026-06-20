@@ -82,6 +82,15 @@ export interface IRModule {
   inputs: IRInput[];
   globals: IRGlobal[];
   functions: IRFunction[];
+  /**
+   * User-defined classes/structs WITH methods, lowered to real TS classes by
+   * the backend. Additive/optional: pre-existing producers/consumers that don't
+   * set or read it are unaffected (treated as `[]`). A struct/class with only
+   * fields and no methods does NOT need to appear here — it is still usable as a
+   * plain value type — but the lowerer emits one whenever the source declared a
+   * `class`/`struct` body (so `new`, methods, and field defaults all work).
+   */
+  classes?: IRClass[];
   /** Names of runtime builtins/constants referenced (for diagnostics + tree-shaking). */
   usedBuiltins: string[];
   /** Map of recognised event handlers present → their function name. */
@@ -133,6 +142,55 @@ export interface IRFunction {
   isAsync: boolean;
   /** The standard event this function implements, if any. */
   event?: EventName;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// User classes / structs (with methods)
+// ─────────────────────────────────────────────────────────────────────────
+
+/** A field of a user class/struct → a TS class property with a zero default. */
+export interface IRField {
+  name: string;
+  type: IRType;
+  /** Constant-folded init, if the source field had one. */
+  init?: IRExpr;
+  /** Array dimension sizes (constant-folded); empty for scalars. */
+  arrayDims: (IRExpr | null)[];
+}
+
+/**
+ * A method of a user class/struct → a TS class method. Same async discipline
+ * as IRFunction: a method that (transitively) trades is `isAsync` and its call
+ * sites are awaited. `isCtor`/`isDtor` mark the constructor / destructor.
+ */
+export interface IRMethod {
+  name: string;
+  returnType: IRType;
+  params: IRParam[];
+  body: IRBlock;
+  isAsync: boolean;
+  /** `true` for the constructor (`ClassName(...)`). */
+  isCtor: boolean;
+  /** `true` for the destructor (`~ClassName(...)`). */
+  isDtor: boolean;
+}
+
+/**
+ * A user-defined class or struct lowered to a real TS class. Single inheritance
+ * via `base` → `extends base`. Templates are handled by ERASURE: `templateParams`
+ * records the type-param names (for documentation/diagnostics) but the body is
+ * emitted un-monomorphised, with the type params treated as untyped.
+ */
+export interface IRClass {
+  name: string;
+  /** 'struct' | 'class' (semantically identical for emission). */
+  keyword: 'struct' | 'class';
+  /** Single base class name, if any → `extends base`. */
+  base?: string;
+  fields: IRField[];
+  methods: IRMethod[];
+  /** Template type-param names; non-empty ⇒ this was a `template<...>` decl. */
+  templateParams: string[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -234,7 +292,9 @@ export type IRRefBinding =
   /** Runtime context variable: _Symbol, _Period, _Digits, _Point. */
   | { kind: 'contextVar'; name: string }
   /** Enum member of a user enum. */
-  | { kind: 'enumMember'; enumName: string; name: string };
+  | { kind: 'enumMember'; enumName: string; name: string }
+  /** The `this` receiver inside a user-class method → emitted bare `this`. */
+  | { kind: 'thisRef' };
 
 export interface IRRef { kind: 'Ref'; binding: IRRefBinding; type: IRType; }
 

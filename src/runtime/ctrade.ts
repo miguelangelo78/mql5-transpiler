@@ -56,6 +56,10 @@ function unsupportedResult(): TradeResult {
   };
 }
 
+/** MT5 ENUM_ORDER_TYPE — the two market types PositionOpen accepts. */
+const ORDER_TYPE_BUY = 0;
+const ORDER_TYPE_SELL = 1;
+
 export class CTrade implements ICTrade {
   private broker: IBroker;
   private defaultSymbol: string;
@@ -66,6 +70,11 @@ export class CTrade implements ICTrade {
   private deviation = 0;
   private filling = 0;
   private logLevel = 0;
+  // ENUM_ACCOUNT_MARGIN_MODE / async-mode config. Stored so RequestMagic() and
+  // the *BySymbol/SetMarginMode/SetAsyncMode setters round-trip; they have no
+  // effect on the deterministic backtest matching engine (documented).
+  private marginMode = 0;
+  private asyncMode = false;
 
   constructor(rt: Runtime) {
     this.broker = rt.broker;
@@ -84,6 +93,31 @@ export class CTrade implements ICTrade {
   }
   LogLevel(level: number): void {
     this.logLevel = level;
+  }
+  /**
+   * Set the fill policy from the symbol's allowed filling modes. The provider
+   * boundary doesn't expose per-symbol filling flags, so we record the request
+   * symbol's existence implicitly: this is config that the backtest matching
+   * engine ignores (it fills deterministically). Returns true (the call is
+   * accepted) — it never affects backtest fills, which is documented honestly
+   * rather than pretending to pick a broker-specific filling mode. (§21)
+   */
+  SetTypeFillingBySymbol(_symbol: string): boolean {
+    // No per-symbol filling info on the boundary → leave `filling` as-is and
+    // accept the call. Effect is a no-op on the backtest engine (documented).
+    return true;
+  }
+  /** Set the account margin mode (NETTING/HEDGING/EXCHANGE). Stored; no effect
+   *  on the netting backtest engine (documented). */
+  SetMarginMode(mode?: number): void {
+    // MT5's SetMarginMode() takes no arg and reads ACCOUNT_MARGIN_MODE; some
+    // overloads pass it explicitly. Store whatever we get (§29: 0 is valid).
+    this.marginMode = mode ?? this.marginMode;
+  }
+  /** Enable/disable async order sending. Stored; the backtest engine resolves
+   *  every order synchronously regardless, so this is config only (documented). */
+  SetAsyncMode(async: boolean): void {
+    this.asyncMode = async;
   }
 
   // ── trading (async) ──
@@ -129,6 +163,49 @@ export class CTrade implements ICTrade {
       deviation: this.deviation,
       magic: this.magic,
       comment: comment,
+    });
+    this.last = res;
+    return this.ok(res);
+  }
+
+  /**
+   * PositionOpen — open a market position of `orderType` (ORDER_TYPE_BUY/SELL).
+   * MT5's signature: PositionOpen(symbol, order_type, volume, price, sl, tp,
+   * comment). Maps the order type to a side and routes to placeMarketOrder.
+   * Rejects (returns false, no I/O) on a non-market order type rather than
+   * guessing a side (§21).
+   */
+  async PositionOpen(
+    symbol: string,
+    orderType: number,
+    volume: number,
+    price?: number,
+    sl?: number,
+    tp?: number,
+    comment?: string,
+  ): Promise<boolean> {
+    let side: 'buy' | 'sell';
+    if (orderType === ORDER_TYPE_BUY) side = 'buy';
+    else if (orderType === ORDER_TYPE_SELL) side = 'sell';
+    else {
+      // Not a market order type → PositionOpen can't service it; fail honestly.
+      this.last = {
+        ...emptyResult(),
+        retcode: TRADE_RETCODE_INVALID,
+        comment: `PositionOpen: order type ${orderType} is not ORDER_TYPE_BUY/SELL`,
+      };
+      return false;
+    }
+    const res = await this.broker.placeMarketOrder({
+      symbol: symbol === '' ? this.defaultSymbol : symbol,
+      side,
+      volume,
+      price,
+      sl,
+      tp,
+      deviation: this.deviation,
+      magic: this.magic,
+      comment,
     });
     this.last = res;
     return this.ok(res);
@@ -247,6 +324,33 @@ export class CTrade implements ICTrade {
     return this.ok(res);
   }
 
+  /**
+   * OrderModify — modify a RESTING pending order's price/SL/TP by ticket.
+   * MT5's signature: OrderModify(ticket, price, sl, tp, type_time, expiration,
+   * stoplimit). We modify price/sl/tp via the optional broker.modifyPendingOrder
+   * (the type_time/expiration/stoplimit operands aren't carried by the boundary;
+   * they're accepted and ignored on the backtest engine, documented). §21 honest
+   * guard: fail loudly (retcode 10013) on an egress lacking pending modification.
+   */
+  async OrderModify(
+    ticket: number,
+    price: number,
+    sl: number,
+    tp: number,
+    _typeTime?: number,
+    _expiration?: number,
+    _stoplimit?: number,
+  ): Promise<boolean> {
+    const modify = this.broker.modifyPendingOrder;
+    if (typeof modify !== 'function') {
+      this.last = unsupportedResult();
+      return false;
+    }
+    const res = await modify.call(this.broker, ticket, price, sl, tp);
+    this.last = res;
+    return this.ok(res);
+  }
+
   /** Shared placement path for all four pending kinds + the §21 honest guard. */
   private async placePending(
     kind: PendingKind,
@@ -294,6 +398,36 @@ export class CTrade implements ICTrade {
   }
   ResultPrice(): number {
     return this.last.price;
+  }
+  /**
+   * ResultBid/ResultAsk — MT5's m_result.bid/ask. The provider boundary's
+   * TradeResult does NOT carry the requote bid/ask, so these are not available
+   * here; we return 0 (the MqlTradeResult zero-init) rather than fabricating a
+   * price (§21). Documented as not-carried; if the live boundary later supplies
+   * them, surface them here.
+   */
+  ResultBid(): number {
+    return 0;
+  }
+  ResultAsk(): number {
+    return 0;
+  }
+  /** The broker comment on the last result. */
+  ResultComment(): string {
+    return this.last.comment;
+  }
+  /**
+   * CheckResultRetcode — MT5 caches a separate m_check_result for OrderCheck.
+   * CTrade has not run a check (no OrderCheck path on this class yet), so we
+   * report the last TRADE result's retcode, which is the closest honest value
+   * the boundary carries. (Documented; a real OrderCheck cache can refine this.)
+   */
+  CheckResultRetcode(): number {
+    return this.last.retcode;
+  }
+  /** The magic number currently configured (MT5 caches m_request.magic). */
+  RequestMagic(): number {
+    return this.magic;
   }
 
   /**

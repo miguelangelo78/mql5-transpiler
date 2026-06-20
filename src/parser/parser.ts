@@ -192,10 +192,16 @@ class Parser {
     if (this.atKeyword('struct') || this.atKeyword('class')) {
       return this.parseStructDecl();
     }
-    // template — best-effort: skip the template header, parse the following decl.
+    // template — ERASURE: capture the type-param names, then parse the following
+    // decl (a templated class or free function) and tag it with those params.
+    // The names are recorded so lowering can treat them as untyped (see lower.ts);
+    // we do NOT monomorphise.
     if (this.atKeyword('template')) {
-      this.skipTemplateHeader();
-      return this.parseTopLevelDecl();
+      const params = this.parseTemplateHeader();
+      const decl = this.parseTopLevelDecl();
+      if (decl && decl.kind === 'StructDecl') decl.templateParams = params;
+      else if (decl && decl.kind === 'FunctionDecl') decl.templateParams = params;
+      return decl;
     }
     // Otherwise: a typed declaration — could be a function or a global var.
     return this.parseTypedDecl();
@@ -272,7 +278,7 @@ class Parser {
     // Forward declaration `struct Foo;`
     if (this.at('Semicolon')) {
       this.next();
-      return { kind: 'StructDecl', keyword, name, base, fields: [], methods: [], span: this.spanFrom(startTok) };
+      return { kind: 'StructDecl', keyword, name, base, fields: [], methods: [], templateParams: [], span: this.spanFrom(startTok) };
     }
 
     this.expect('LBrace');
@@ -298,7 +304,7 @@ class Parser {
     }
     this.expect('RBrace');
     if (this.at('Semicolon')) this.next();
-    return { kind: 'StructDecl', keyword, name, base, fields, methods, span: this.spanFrom(startTok) };
+    return { kind: 'StructDecl', keyword, name, base, fields, methods, templateParams: [], span: this.spanFrom(startTok) };
   }
 
   /**
@@ -1134,20 +1140,57 @@ class Parser {
     };
   }
 
-  // Skip a `template<...>` header (balanced angle brackets).
-  private skipTemplateHeader(): void {
+  /**
+   * Parse a `template<typename T, class U, ...>` header and return the declared
+   * type-parameter names (`['T','U']`). Consumes the balanced angle brackets.
+   *
+   * We collect the LAST identifier of each comma-separated clause inside the
+   * top-level angle brackets — for `typename T` / `class U` that is the param
+   * name; for a bare `T` it is `T`. Nested angle brackets (e.g. a default
+   * `= vector<int>`) are tracked by depth and skipped. Erasure only needs the
+   * names so lowering can treat them as untyped; we do not parse constraints.
+   */
+  private parseTemplateHeader(): string[] {
     this.expect('Keyword', 'template');
-    if (this.atOp('<')) {
-      let depth = 0;
-      // angle brackets are operators; count < and >
-      do {
-        const t = this.next();
-        if (t.kind === 'Operator' && t.value === '<') depth++;
-        else if (t.kind === 'Operator' && t.value === '>') depth--;
-        else if (t.kind === 'Operator' && t.value === '>>') depth -= 2;
-        if (this.isEOF()) break;
-      } while (depth > 0);
+    const params: string[] = [];
+    if (!this.atOp('<')) return params;
+    this.next(); // consume the opening '<'
+    let depth = 1;
+    let lastIdent: string | undefined;
+    /** true once we hit a top-level `=` default — ignore idents until comma/close. */
+    let inDefault = false;
+    const commit = (): void => {
+      if (lastIdent !== undefined) params.push(lastIdent);
+      lastIdent = undefined;
+      inDefault = false;
+    };
+    while (depth > 0 && !this.isEOF()) {
+      const t = this.peek();
+      if (t.kind === 'Operator' && t.value === '<') {
+        depth++;
+        this.next();
+      } else if (t.kind === 'Operator' && t.value === '>') {
+        depth--;
+        this.next();
+        if (depth === 0) commit();
+      } else if (t.kind === 'Operator' && t.value === '>>') {
+        // `>>` closes two levels at once (e.g. `template<class T = A<B>>`).
+        depth -= 2;
+        this.next();
+        if (depth <= 0) commit();
+      } else if (t.kind === 'Comma' && depth === 1) {
+        this.next();
+        commit();
+      } else {
+        // The param name is the last identifier of the clause BEFORE any `=`
+        // default. Once a top-level `=` is seen, stop tracking idents for this
+        // clause (the default's identifiers are not the param name).
+        if (t.kind === 'Operator' && t.value === '=' && depth === 1) inDefault = true;
+        else if (t.kind === 'Identifier' && depth === 1 && !inDefault) lastIdent = t.value;
+        this.next();
+      }
     }
+    return params;
   }
 
   private skipBalancedParens(): void {
