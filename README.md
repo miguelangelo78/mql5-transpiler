@@ -81,15 +81,31 @@ Coverage is honest: `npm run ea` reports any gap for **your** EA. Globally today
   user classes-with-methods / templates. `npm run ea` names any gap in *your* EA; the exact
   implemented set lives in [`src/runtime/coverage.ts`](src/runtime/coverage.ts).
 
-## Sample EAs
+## Examples
 
-- **[`examples/MovingAverageCross.mq5`](examples/MovingAverageCross.mq5)** — SMA crossover; flips
-  the position on the opposite cross (netting).
-- **[`examples/IndicatorShowcase.mq5`](examples/IndicatorShowcase.mq5)** — a spread of the newer
-  builtins: `iBands` / `iMACD` / `iStochastic` via `CopyBuffer`, `Math*` / `String*`, `OrdersTotal`.
-- **[`examples/RsiReversal.mq5`](examples/RsiReversal.mq5)** — RSI mean-reversion: ATR-sized
-  **pending limit** entries with ATR SL/TP, managed on `OnTimer`. Exercises the Wilder indicators,
-  the pending-order book, and intrabar SL/TP triggering.
+The [`examples/`](examples) directory has runnable EAs — **every one transpiles with zero
+diagnostics and backtests.** Start with `npm run ea -- examples/HelloWorld.mq5`, then try any of:
+
+| EA | Strategy / what it shows |
+|---|---|
+| [`HelloWorld.mq5`](examples/HelloWorld.mq5) | minimal lifecycle (`OnInit`/`OnTick`/`OnDeinit`, prints, no trades) — the "it works" starter |
+| [`MovingAverageCross.mq5`](examples/MovingAverageCross.mq5) | SMA crossover, flips on the opposite cross |
+| [`MacdTrend.mq5`](examples/MacdTrend.mq5) | MACD(12,26,9) trend follower |
+| [`TripleMa.mq5`](examples/TripleMa.mq5) | stacked fast/medium/slow SMA system |
+| [`AdxTrendFilter.mq5`](examples/AdxTrendFilter.mq5) | MA crossover gated by `iADX` trend strength (multi-buffer) |
+| [`RsiBollinger.mq5`](examples/RsiBollinger.mq5) | Bollinger mean-reversion confirmed by RSI |
+| [`StochasticScalper.mq5`](examples/StochasticScalper.mq5) | %K/%D cross scalper with ATR brackets |
+| [`RsiReversal.mq5`](examples/RsiReversal.mq5) | RSI reversal: ATR-sized pending limits, managed on `OnTimer` |
+| [`AtrTrailingStop.mq5`](examples/AtrTrailingStop.mq5) | trend entry + ATR trailing stop (`CPositionInfo` + `PositionModify`) |
+| [`ChannelBreakout.mq5`](examples/ChannelBreakout.mq5) | Donchian breakout via pending stop orders |
+| [`RawOrderSendGrid.mq5`](examples/RawOrderSendGrid.mq5) | grid built on the raw `OrderSend` + `MqlTradeRequest` API |
+| [`OopRiskManaged.mq5`](examples/OopRiskManaged.mq5) | a user `RiskManager` class + `CAccountInfo`/`CSymbolInfo` position sizing |
+| [`IcustomMomentum.mq5`](examples/IcustomMomentum.mq5) | loads a custom indicator ([`indicators/MomentumSlope.mq5`](examples/indicators/MomentumSlope.mq5)) via `iCustom` |
+| [`IndicatorShowcase.mq5`](examples/IndicatorShowcase.mq5) | `iBands`/`iMACD`/`iStochastic` + `Math*`/`String*` |
+
+> The mean-reversion EAs (RSI-Bollinger, Stochastic) are intentionally **net-negative** on the
+> built-in synthetic feed — it's a trend-shaped series, so counter-trend strategies lose. Honest by
+> design, not tuned to fake a profit. Point them at real bars and they behave differently.
 
 ## How it works
 
