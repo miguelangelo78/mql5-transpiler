@@ -89,6 +89,7 @@ diagnostics and backtests.** Start with `npm run ea -- examples/HelloWorld.mq5`,
 | EA | Strategy / what it shows |
 |---|---|
 | [`HelloWorld.mq5`](examples/HelloWorld.mq5) | minimal lifecycle (`OnInit`/`OnTick`/`OnDeinit`, prints, no trades) — the "it works" starter |
+| [`OpenCloseBtc.mq5`](examples/OpenCloseBtc.mq5) | opens `0.01`, holds 10 s, closes on `OnTimer` — the minimal **live**-trade demo for `npm run ea:live` |
 | [`MovingAverageCross.mq5`](examples/MovingAverageCross.mq5) | SMA crossover, flips on the opposite cross |
 | [`MacdTrend.mq5`](examples/MacdTrend.mq5) | MACD(12,26,9) trend follower |
 | [`TripleMa.mq5`](examples/TripleMa.mq5) | stacked fast/medium/slow SMA system |
