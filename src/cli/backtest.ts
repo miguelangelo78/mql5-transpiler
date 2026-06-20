@@ -1,0 +1,140 @@
+/**
+ * `backtest` CLI — run an ALREADY-EMITTED EA module against synthetic data.
+ *
+ *   npm run backtest -- <path/to/emitted.ts> [symbol] [timeframe] [bars] [seed]
+ *
+ * Unlike `poc` (which transpiles the sample first), this takes a module that
+ * was produced earlier by `transpile` and just runs + prints it. It shares the
+ * same engine driver + report printer as `poc`, so the two stay consistent.
+ *
+ * Defaults: symbol EURUSD, timeframe PERIOD_M1 (1), 3000 bars, seed 0x5eed,
+ * initial balance 10000. A 0 for any numeric arg is honoured as a real value
+ * (§29), not treated as "use the default".
+ */
+
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+import { runBacktest } from '../engine/driver';
+import { printReport } from '../engine/report-print';
+import type { ExpertFactory, Inputs } from '../runtime/runtime';
+import type { BacktestConfig } from '../runtime/providers/backtest/index';
+
+export interface RunModuleOptions {
+  /** Path to the emitted EA module (absolute or relative to cwd). */
+  modulePath: string;
+  symbol?: string;
+  timeframe?: number;
+  bars?: number;
+  startPrice?: number;
+  startTime?: number;
+  seed?: number;
+  initialBalance?: number;
+  inputs?: Inputs;
+  timeframeLabel?: string;
+}
+
+const PERIOD_M1 = 1;
+
+/** Load an emitted module and run it; returns the report (no printing). */
+export async function runEmittedModule(opts: RunModuleOptions) {
+  const abs = resolve(opts.modulePath);
+  const mod: unknown = await import(pathToFileURL(abs).href);
+  const factory = (mod as { createExpert?: unknown }).createExpert;
+  if (typeof factory !== 'function') {
+    throw new Error(
+      `Module ${abs} does not export a createExpert function (got ${typeof factory}).`,
+    );
+  }
+
+  // §29: an explicitly-passed 0 must be honoured; only an absent (undefined)
+  // option falls back to the default. `??` does exactly that.
+  const symbol = opts.symbol ?? 'EURUSD';
+  const timeframe = opts.timeframe ?? PERIOD_M1;
+  const startPrice = opts.startPrice ?? 1.1;
+
+  // Price-PROPORTIONAL cycle amplitude so the generated series is realistic for
+  // ANY start price. The synthetic generator's own default amplitude
+  // (`max(startPrice*0.01, 5)`) has a fixed 5.0 floor meant for index/equity
+  // prices in the thousands — applied to a 1.10 FX pair it swings the price into
+  // the negatives. A flat 2% of the start price (≈220 pips on EURUSD) crosses
+  // the SMAs cleanly at any scale, with noise/wick scaled to match. This is a
+  // CLI data-shape default only; the EA + indicator math are untouched (§21).
+  const cycleAmplitude = startPrice * 0.02;
+
+  const config: BacktestConfig = {
+    symbol,
+    timeframe,
+    initialBalance: opts.initialBalance ?? 10000,
+    bars: {
+      bars: opts.bars ?? 3000,
+      startPrice,
+      startTime: opts.startTime ?? Math.floor(Date.UTC(2024, 0, 1) / 1000),
+      seed: opts.seed ?? 0x5eed,
+      cycleAmplitude,
+      cyclePeriodBars: 120,
+      noise: cycleAmplitude * 0.04,
+      wick: cycleAmplitude * 0.025,
+    },
+  };
+
+  return runBacktest({
+    factory: factory as ExpertFactory,
+    config,
+    inputs: opts.inputs,
+  });
+}
+
+/**
+ * Parse an integer CLI arg, honouring an explicit 0 (§29). Returns `fallback`
+ * only when the arg is absent or not a finite number.
+ */
+function intArg(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  if (args.length === 0) {
+    process.stderr.write(
+      'usage: tsx src/cli/backtest.ts <emitted.ts> [symbol] [timeframe] [bars] [seed]\n',
+    );
+    process.exit(2);
+  }
+
+  const modulePath = args[0]!;
+  const symbol = args[1];
+  const timeframe = args[2] !== undefined ? intArg(args[2], PERIOD_M1) : undefined;
+  const bars = args[3] !== undefined ? intArg(args[3], 3000) : undefined;
+  const seed = args[4] !== undefined ? intArg(args[4], 0x5eed) : undefined;
+
+  const report = await runEmittedModule({
+    modulePath,
+    symbol,
+    timeframe,
+    bars,
+    seed,
+  });
+
+  printReport(report, { transpiledPath: resolve(modulePath) });
+
+  if (report.totalDeals === 0) {
+    process.stderr.write('\nWARNING: 0 deals produced.\n');
+    process.exitCode = 1;
+  }
+}
+
+import { fileURLToPath } from 'node:url';
+const invokedDirectly =
+  process.argv[1] !== undefined &&
+  resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (invokedDirectly) {
+  main().catch((err: unknown) => {
+    process.stderr.write(
+      `backtest failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`,
+    );
+    process.exit(1);
+  });
+}

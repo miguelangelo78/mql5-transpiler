@@ -1,0 +1,29 @@
+{
+  "name": "mql5-transpiler",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Transpiles MQL5 source into TypeScript and runs the strategy on a pluggable backtest/live engine.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "ea": "tsx src/cli/run.ts",
+    "ea:live": "tsx src/cli/ea-live.ts",
+    "poc": "tsx src/cli/poc.ts",
+    "poc:rsi": "tsx src/cli/poc-rsi.ts",
+    "transpile": "tsx src/cli/transpile.ts",
+    "backtest": "tsx src/cli/backtest.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tickerall/sdk": "^0.1.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "tsx": "^4.22.4",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  }
+}

@@ -1,0 +1,185 @@
+# mql5-transpiler
+
+Transpile **MQL5** (MetaTrader 5's language) into **TypeScript** and run the strategy on a
+pluggable engine — **backtest** it on historical/synthetic data, or run it **live** against a
+broker. Same transpiled EA; you just swap the provider.
+
+> **Status: proof-of-concept, working end-to-end.** Two real EAs transpile and backtest
+> deterministically. Bar-based fidelity tier (see [Fidelity & limitations](#fidelity--limitations-honest)).
+> The transpiler is **honest about what it supports** — it tells you, per-EA, exactly what it can't run yet.
+
+## Quickstart
+
+Requires Node ≥ 20 (developed on Node 24).
+
+```bash
+npm install
+npm run poc       # transpile + backtest the SMA-crossover sample
+npm run poc:rsi   # transpile + backtest the RSI / ATR / pending-orders sample
+```
+
+## Run your own EA
+
+Drop a `.mq5` anywhere and point the `ea` runner at it:
+
+```bash
+npm run ea -- path/to/YourEA.mq5
+```
+
+It **transpiles** your EA to TypeScript, tells you **exactly** what (if anything) it can't
+support yet, and — if it's fully supported — **backtests** it on deterministic synthetic data
+and prints a trade-for-trade report.
+
+If your EA uses a builtin the runtime doesn't implement yet, you get a precise list and a
+non-zero exit — never a silent breakage:
+
+```
+✗ YourEA uses 1 builtin(s) the runtime does not implement yet.
+  error[MQL_UNIMPLEMENTED_BUILTIN]: Builtin 'iCustom()' is recognised but NOT implemented …
+```
+
+### Flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--symbol <NAME>` | `EURUSD` | symbol name |
+| `--timeframe <N>` | `1` (M1) | MT5 timeframe id (1=M1, 5=M5, 15=M15, 30=M30, …) |
+| `--bars <N>` | `3000` | number of synthetic bars |
+| `--seed <N>` | `0x5eed` | PRNG seed (deterministic — same seed, same bars) |
+| `--price <N>` | `1.10` | starting price |
+| `--balance <N>` | `10000` | starting balance |
+| `--input <Name=Value>` | — | set an EA input (repeatable); value parsed as number / `true` / `false` / string |
+
+```bash
+npm run ea -- examples/MovingAverageCross.mq5 --input InpFastPeriod=5 --input InpSlowPeriod=50
+npm run ea -- examples/RsiReversal.mq5 --timeframe 15 --bars 2000 --seed 42
+```
+
+## What's supported
+
+Coverage is honest: `npm run ea` reports any gap for **your** EA. Globally today:
+
+- **Program type:** Expert Advisors. (Custom indicators / scripts / services / libraries are the next scope dial.)
+- **Language:** preprocessor (`#include` / `#define` / `#property`), the full C/MQL5 expression
+  grammar (precedence, ternary, casts, `new`/`delete`, member/index/call, pre/post `++`/`--`),
+  all statement forms, `enum`/`struct`, `input` parameters, the `CTrade` Standard-Library class,
+  object pointers.
+- **Indicators — MT5-exact, replicated 1:1 from MetaQuotes' own source:** `iMA`
+  (SMA / EMA / SMMA / LWMA), `iRSI` (Wilder), `iATR` (MT5's SMA-of-True-Range), `iBands`,
+  `iMACD`, `iStochastic`, `iADX`, `iCCI`, `iMomentum`, plus `iBars` / `iHighest` / `iLowest` /
+  `iVolume`. `CopyBuffer` (multi-buffer) with MT5 as-series indexing and per-method warm-up.
+- **Trading:** `CTrade.Buy` / `Sell` / `PositionClose` / `PositionModify`; **pending orders**
+  `BuyLimit` / `SellLimit` / `BuyStop` / `SellStop` + `OrderDelete`; `PositionSelect` /
+  `PositionGet*`; the order pool (`OrdersTotal` / `OrderSelect` / `OrderGet*`) and trade
+  **history** (`HistorySelect` / `HistoryDealsTotal` / `HistoryDealGet*`).
+- **Library functions:** `CopyRates` / `CopyClose` / … family, all `Math*`, `String*`
+  (printf-faithful `StringFormat`), `Array*`, `*ToString`, `SymbolInfo*` / `AccountInfo*` /
+  `Time*`. (~103 builtins covered.)
+- **Events:** `OnInit` / `OnDeinit` / `OnTick` / `OnTimer` (+ `EventSetTimer` / `EventKillTimer`).
+- **Not yet implemented** (caught at *compile* time, never silently): `iCustom`, raw
+  `OrderSend`, a few `CTrade` methods (`PositionOpen` / `OrderModify` / config setters), and
+  user classes-with-methods / templates. `npm run ea` names any gap in *your* EA; the exact
+  implemented set lives in [`src/runtime/coverage.ts`](src/runtime/coverage.ts).
+
+## Sample EAs
+
+- **[`examples/MovingAverageCross.mq5`](examples/MovingAverageCross.mq5)** — SMA crossover; flips
+  the position on the opposite cross (netting).
+- **[`examples/IndicatorShowcase.mq5`](examples/IndicatorShowcase.mq5)** — a spread of the newer
+  builtins: `iBands` / `iMACD` / `iStochastic` via `CopyBuffer`, `Math*` / `String*`, `OrdersTotal`.
+- **[`examples/RsiReversal.mq5`](examples/RsiReversal.mq5)** — RSI mean-reversion: ATR-sized
+  **pending limit** entries with ATR SL/TP, managed on `OnTimer`. Exercises the Wilder indicators,
+  the pending-order book, and intrabar SL/TP triggering.
+
+## How it works
+
+```
+.mq5 ─► lexer ─► parser ─► IR ─► TypeScript backend ─► out/<name>.ts
+                                                          │  (createExpert factory)
+              runtime (MQL5 builtins) + provider boundary │
+                                                          ▼
+   IBroker / IMarketFeed / IClock ──┬── Backtest provider (sim matching engine + sim clock)
+                                    └── Live provider (TickerAll hosted API — any MT4/MT5 broker)
+                                          └─► engine driver runs the EA's handlers
+```
+
+The transpiled EA calls only **`IBroker` / `IMarketFeed` / `IClock`**, never a concrete broker.
+Swapping the implementation swaps **live ↔ backtest** with zero EA changes. There are two axes of
+pluggability: target-language backends (TypeScript now; Python later) and broker-egress providers
+(TickerAll now; native C/Rust later). See [`CLAUDE.md`](CLAUDE.md) for the full product model.
+
+## Live trading via TickerAll
+
+The live egress is [TickerAll](https://tickerall.com) — a hosted API that connects to any MT4/MT5
+broker with just an API key (no MT4/MT5 terminal in the path, nothing private to install). Get a
+free key (the free tier covers demo accounts), then run **any** EA live:
+
+```bash
+TICKERALL_API_KEY=cf_api_... BROKER_PASSWORD=yourBrokerPassword \
+  npm run ea:live -- examples/MovingAverageCross.mq5 \
+    --server FBS-Demo --account 12345678 --symbol EURUSD --timeframe M5 --duration 60
+```
+
+It transpiles the EA, refuses (with the honesty diagnostics) if it uses an unsupported builtin, then
+runs it live — firing `OnTick` on each market tick and `OnTimer` on the timer, against live data and a
+real (use a **demo** account first) broker connection. **Secrets are read from the environment only**
+(`TICKERALL_API_KEY`, `BROKER_PASSWORD`), never argv.
+
+Under the hood, [`src/runtime/providers/tickerall/`](src/runtime/providers/tickerall) implements the
+same `IBroker` / `IMarketFeed` / `IClock` boundary over [`@tickerall/sdk`](https://www.npmjs.com/package/@tickerall/sdk):
+`createTickerallProviders(config)` opens the broker session, pre-fetches candle history + symbol specs
+(so `IMarketFeed.history()` stays synchronous over the async API), streams live ticks/positions, and
+returns the providers + a `disconnect()`. The **same transpiled EA** runs live or in backtest.
+
+## Fidelity & limitations (honest)
+
+- **Bar-based tier.** Pending / SL / TP fill intrabar from the bar OHLC — limits fill at the
+  trigger price, gaps fill at the gap-open (worse for SL, better for TP), and when SL and TP are
+  both inside one bar **SL wins** (conservative). There is **no** spread / swap / commission /
+  slippage yet. Tick-accurate is the next fidelity tier.
+- **`iATR` is SMA-of-True-Range** — MT5's actual definition (verified against MetaQuotes' `ATR.mq5`),
+  *not* Wilder smoothing. `iRSI` *is* Wilder (with MT5's flat-market = 50 / all-up = 100 edge cases).
+- **No MT5 Strategy-Tester diff yet.** The intended validation is a trade-for-trade diff against
+  MT5's own tester; that oracle isn't wired in (the dev box's MT5 doesn't execute MQL headless).
+  Results today are self-consistent and unit-verified, **not** yet tester-validated.
+
+## Scripts
+
+| Script | What it does |
+|---|---|
+| `npm run ea -- <file.mq5>` | transpile **+ backtest any EA** (your main entry point) |
+| `npm run ea:live -- <file.mq5> …` | transpile **+ run any EA LIVE** via TickerAll (env: `TICKERALL_API_KEY`, `BROKER_PASSWORD`) |
+| `npm run poc` | the SMA-crossover sample, end-to-end |
+| `npm run poc:rsi` | the RSI / pending-orders sample, end-to-end |
+| `npm run transpile -- <file.mq5>` | transpile only → `out/<name>.ts` |
+| `npm run backtest -- <emitted.ts>` | backtest an already-emitted module |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm test` | the vitest suite |
+
+## Project layout
+
+```
+src/
+  lexer/       preprocessor + tokenizer
+  parser/      AST + recursive-descent parser
+  sema/        symbol resolution + intrinsic classification + IR lowering
+  ir/          language-neutral IR + the emission ABI
+  backend/     IR → TypeScript emitter
+  runtime/     MQL5 builtins, indicators, CTrade, constants, the coverage manifest
+    providers/   IBroker / IMarketFeed / IClock — backtest + live (TickerAll)
+  engine/      backtest driver + report printer
+  cli/         ea / ea:live / poc / poc:rsi / transpile / backtest
+  diagnostics.ts   the honesty layer (compile-time gap reporting)
+examples/      sample EAs (.mq5)
+test/          vitest suites
+```
+
+## Development
+
+```bash
+npm test          # 280 tests
+npm run typecheck # strict tsc, no emit
+```
+
+Design decisions, the architecture rationale, and the two-deployment product model are documented
+in [`CLAUDE.md`](CLAUDE.md).
