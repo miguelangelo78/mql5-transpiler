@@ -19,6 +19,7 @@ import { runBacktest } from '../engine/driver';
 import { printReport } from '../engine/report-print';
 import type { ExpertFactory, Inputs } from '../runtime/runtime';
 import type { BacktestConfig } from '../runtime/providers/backtest/index';
+import type { Bar, SymbolSpec } from '../runtime/providers/types';
 
 export interface RunModuleOptions {
   /** Path to the emitted EA module (absolute or relative to cwd). */
@@ -32,6 +33,12 @@ export interface RunModuleOptions {
   initialBalance?: number;
   inputs?: Inputs;
   timeframeLabel?: string;
+  /** REAL historical bars (e.g. loaded from a CSV). When present + non-empty,
+   *  the backtest runs on these instead of the synthetic generator. */
+  realBars?: Bar[];
+  /** Symbol spec for the real data (digits/point/contractSize/tickValue). A
+   *  documented FX-like default is used when omitted. */
+  symbolSpec?: SymbolSpec;
 }
 
 const PERIOD_M1 = 1;
@@ -62,21 +69,30 @@ export async function runEmittedModule(opts: RunModuleOptions) {
   // CLI data-shape default only; the EA + indicator math are untouched (§21).
   const cycleAmplitude = startPrice * 0.02;
 
-  const config: BacktestConfig = {
-    symbol,
-    timeframe,
-    initialBalance: opts.initialBalance ?? 10000,
-    bars: {
-      bars: opts.bars ?? 3000,
-      startPrice,
-      startTime: opts.startTime ?? Math.floor(Date.UTC(2024, 0, 1) / 1000),
-      seed: opts.seed ?? 0x5eed,
-      cycleAmplitude,
-      cyclePeriodBars: 120,
-      noise: cycleAmplitude * 0.04,
-      wick: cycleAmplitude * 0.025,
-    },
-  };
+  const useReal = opts.realBars !== undefined && opts.realBars.length > 0;
+  const config: BacktestConfig = useReal
+    ? {
+        symbol,
+        timeframe,
+        initialBalance: opts.initialBalance ?? 10000,
+        bars: opts.realBars!,
+        ...(opts.symbolSpec ? { symbolSpec: opts.symbolSpec } : {}),
+      }
+    : {
+        symbol,
+        timeframe,
+        initialBalance: opts.initialBalance ?? 10000,
+        bars: {
+          bars: opts.bars ?? 3000,
+          startPrice,
+          startTime: opts.startTime ?? Math.floor(Date.UTC(2024, 0, 1) / 1000),
+          seed: opts.seed ?? 0x5eed,
+          cycleAmplitude,
+          cyclePeriodBars: 120,
+          noise: cycleAmplitude * 0.04,
+          wick: cycleAmplitude * 0.025,
+        },
+      };
 
   return runBacktest({
     factory: factory as ExpertFactory,

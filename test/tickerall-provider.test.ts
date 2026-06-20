@@ -22,6 +22,7 @@ import {
 import { TickerallFeed } from '../src/runtime/providers/tickerall/feed';
 import { TickerallBroker } from '../src/runtime/providers/tickerall/broker';
 import { createTickerallProviders } from '../src/runtime/providers/tickerall';
+import { fetchHistoryBars } from '../src/runtime/providers/tickerall/history';
 
 // ── A structural mock of the bits of the SDK the provider touches ──────────
 function makeMock() {
@@ -171,6 +172,26 @@ describe('TickerallBroker (orders over a mock client + sync reads)', () => {
     // no position on an unknown symbol → honest reject, no API call
     const r2 = await b.closePosition('GBPUSD');
     expect(r2.ok).toBe(false);
+  });
+});
+
+describe('fetchHistoryBars (real-data backtest source, mock client)', () => {
+  it('pulls candles + spec through the live mappings and ends the session', async () => {
+    const m = makeMock();
+    const hist = await fetchHistoryBars({
+      apiKey: 'x', broker: 'mt5', server: 'X', account: 1, password: 'y',
+      symbol: 'EURUSD', timeframe: 5, count: 2, client: asClient(m.client),
+    });
+    // candles → Bars (same mapping the live feed uses), chronological
+    expect(hist.bars.length).toBe(2);
+    expect(hist.bars.map((b) => b.time)).toEqual([1000, 1300]);
+    expect(hist.bars[0]).toMatchObject({ open: 1.1, close: 1.105, realVolume: 0 });
+    // broker symbol spec carried through (not a fabricated default)
+    expect(hist.spec?.name).toBe('EURUSD');
+    expect(hist.spec?.contractSize).toBe(100000);
+    // the session is always ended (account not left armed)
+    expect(m.calls.keepAlive).toBeDefined();
+    expect(m.calls.end![0]).toEqual(['acc_test']);
   });
 });
 

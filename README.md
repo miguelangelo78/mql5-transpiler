@@ -43,16 +43,50 @@ non-zero exit — never a silent breakage:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--symbol <NAME>` | `EURUSD` | symbol name |
-| `--timeframe <N>` | `1` (M1) | MT5 timeframe id (1=M1, 5=M5, 15=M15, 30=M30, …) |
-| `--bars <N>` | `3000` | number of synthetic bars |
+| `--timeframe <TF>` | `M1` | MT5 timeframe — name (`M1`/`M5`/`M15`/`M30`/`H1`/`H4`/`D1`/`W1`/`MN1`) or numeric id |
+| `--bars <N>` | `3000` | number of **synthetic** bars (ignored with `--csv`) |
 | `--seed <N>` | `0x5eed` | PRNG seed (deterministic — same seed, same bars) |
-| `--price <N>` | `1.10` | starting price |
+| `--price <N>` | `1.10` | starting price (synthetic only) |
 | `--balance <N>` | `10000` | starting balance |
 | `--input <Name=Value>` | — | set an EA input (repeatable); value parsed as number / `true` / `false` / string |
 
 ```bash
 npm run ea -- examples/MovingAverageCross.mq5 --input InpFastPeriod=5 --input InpSlowPeriod=50
 npm run ea -- examples/RsiReversal.mq5 --timeframe 15 --bars 2000 --seed 42
+```
+
+### Backtest on **real** broker history (`--source tickerall`)
+
+`npm run ea` backtests on a synthetic feed by default. Add `--source tickerall`
+and it fetches the symbol's **real historical candles from the broker** (through
+the same TickerAll feed the live path streams, with the broker's own symbol spec)
+and replays them deterministically. The transpiled EA is unchanged — only the data
+source is: synthetic → real-history backtest → live, same EA throughout. This
+mirrors MT5's Strategy Tester, which replays the history the terminal downloaded
+from the broker.
+
+Secrets come from the environment, never argv:
+
+| | |
+|---|---|
+| `TICKERALL_API_KEY` | your TickerAll key (free demo tier works) |
+| `BROKER_PASSWORD` | the broker account password |
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--source tickerall` | `synthetic` | fetch real broker history instead of generating bars |
+| `--broker <mt4\|mt5>` | `mt5` | broker platform |
+| `--server <NAME>` | — | broker server, e.g. `FBS-Demo` (required) |
+| `--account <N>` | — | numeric broker login (required) |
+| `--symbol <NAME>` | — | broker-native symbol, e.g. `BTCUSD` (required) |
+| `--history <N>` | `500` | bars of history to fetch |
+
+```bash
+TICKERALL_API_KEY=cf_api_… BROKER_PASSWORD=… \
+  npm run ea -- examples/MovingAverageCross.mq5 \
+    --source tickerall --server FBS-Demo --account 123456 \
+    --symbol BTCUSD --timeframe D1 --history 500 \
+    --input InpFastPeriod=20 --input InpSlowPeriod=50 --input InpLots=0.01
 ```
 
 ## What's supported

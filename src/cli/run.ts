@@ -36,7 +36,9 @@ import { transpileFile } from './transpile';
 import { runEmittedModule } from './backtest';
 import { printReport } from '../engine/report-print';
 import { formatDiagnostics, hasErrors, countBySeverity } from '../diagnostics';
+import { fetchHistoryBars } from '../runtime/providers/tickerall/history';
 import type { Inputs } from '../runtime/runtime';
+import type { Bar, SymbolSpec } from '../runtime/providers/types';
 
 interface ParsedArgs {
   file: string;
@@ -47,6 +49,25 @@ interface ParsedArgs {
   price?: number;
   balance?: number;
   inputs: Inputs;
+  /** Where the backtest's bars come from: 'synthetic' (default, offline) or
+   *  'tickerall' (fetch REAL broker history through the live feed). */
+  source?: 'synthetic' | 'tickerall';
+  /** TickerAll source: broker kind / server / login / bars to fetch. */
+  broker?: 'mt4' | 'mt5';
+  server?: string;
+  account?: number;
+  history?: number;
+}
+
+/** MT5 ENUM_TIMEFRAMES name → id (so `--timeframe D1` works as well as the int). */
+const TF: Record<string, number> = {
+  M1: 1, M5: 5, M15: 15, M30: 30, H1: 16385, H4: 16388, D1: 16408, W1: 32769, MN1: 49153,
+};
+function parseTimeframe(v: string): number {
+  const up = v.toUpperCase();
+  if (up in TF) return TF[up]!;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 1;
 }
 
 /** Parse `Value` as a number, then bool, else keep the raw string. */
@@ -76,11 +97,23 @@ function parseArgs(argv: string[]): ParsedArgs {
     };
     switch (key) {
       case 'symbol': out.symbol = need(); break;
-      case 'timeframe': out.timeframe = Number(need()); break;
+      case 'timeframe': out.timeframe = parseTimeframe(need()); break;
       case 'bars': out.bars = Number(need()); break;
       case 'seed': out.seed = Number(need()); break;
       case 'price': out.price = Number(need()); break;
       case 'balance': out.balance = Number(need()); break;
+      case 'source': {
+        const v = need().toLowerCase();
+        if (v !== 'synthetic' && v !== 'tickerall') {
+          throw new Error(`--source must be 'synthetic' or 'tickerall', got '${v}'`);
+        }
+        out.source = v;
+        break;
+      }
+      case 'broker': out.broker = need() === 'mt4' ? 'mt4' : 'mt5'; break;
+      case 'server': out.server = need(); break;
+      case 'account': out.account = Number(need()); break;
+      case 'history': out.history = Number(need()); break;
       case 'input': {
         const pair = need();
         const eq = pair.indexOf('=');
@@ -99,8 +132,10 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 const USAGE =
   'usage: npm run ea -- <YourEA.mq5> ' +
-  '[--symbol EURUSD] [--timeframe 1] [--bars 3000] [--seed N] ' +
-  '[--price 1.10] [--balance 10000] [--input Name=Value ...]\n';
+  '[--symbol EURUSD] [--timeframe D1|1] [--bars 3000] [--seed N] ' +
+  '[--price 1.10] [--balance 10000] [--input Name=Value ...]\n' +
+  '   real broker history (env TICKERALL_API_KEY + BROKER_PASSWORD):\n' +
+  '       --source tickerall --server <NAME> --account <N> --symbol <NAME> [--timeframe D1] [--history 500]\n';
 
 async function main(): Promise<void> {
   let args: ParsedArgs;
@@ -138,6 +173,53 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Real historical data via --source tickerall (else the synthetic generator).
+  // The bars come from the SAME broker feed the live path streams; the backtest
+  // then replays them deterministically — the EA is unchanged, only the source.
+  let realBars: Bar[] | undefined;
+  let symbolSpec: SymbolSpec | undefined;
+  if (args.source === 'tickerall') {
+    const apiKey = process.env.TICKERALL_API_KEY;
+    const password = process.env.BROKER_PASSWORD;
+    const miss: string[] = [];
+    if (!apiKey) miss.push('env TICKERALL_API_KEY');
+    if (!password) miss.push('env BROKER_PASSWORD');
+    if (!args.server) miss.push('--server');
+    if (args.account === undefined) miss.push('--account');
+    if (!args.symbol) miss.push('--symbol');
+    if (miss.length > 0) {
+      process.stderr.write(
+        `✗ --source tickerall needs: ${miss.join(', ')}\n` +
+          `  e.g. TICKERALL_API_KEY=… BROKER_PASSWORD=… npm run ea -- ${args.file} \\\n` +
+          `         --source tickerall --server FBS-Demo --account 123456 --symbol BTCUSD --timeframe D1\n`,
+      );
+      process.exit(2);
+    }
+    const count = args.history ?? 500;
+    process.stdout.write(
+      `Fetching ${count} ${args.symbol} bars from ${args.server} (account ${args.account}) via TickerAll …\n`,
+    );
+    const hist = await fetchHistoryBars({
+      apiKey: apiKey!,
+      broker: args.broker ?? 'mt5',
+      server: args.server!,
+      account: args.account!,
+      password: password!,
+      symbol: args.symbol!,
+      timeframe: args.timeframe ?? 1,
+      count,
+    });
+    realBars = hist.bars;
+    symbolSpec = hist.spec;
+    if (realBars.length === 0) {
+      process.stderr.write(`✗ TickerAll returned 0 bars for ${args.symbol}\n`);
+      process.exit(1);
+    }
+    const first = realBars[0]!, last = realBars[realBars.length - 1]!;
+    const d = (t: number) => new Date(t * 1000).toISOString().slice(0, 10);
+    process.stdout.write(`  got ${realBars.length} real bars (${d(first.time)} → ${d(last.time)})\n`);
+  }
+
   process.stdout.write(`✓ ${name} is fully supported — running backtest…\n`);
   const report = await runEmittedModule({
     modulePath: outPath,
@@ -148,6 +230,8 @@ async function main(): Promise<void> {
     startPrice: args.price,
     initialBalance: args.balance,
     inputs: Object.keys(args.inputs).length > 0 ? args.inputs : undefined,
+    realBars,
+    symbolSpec,
   });
 
   printReport(report, { transpiledPath: outPath });
