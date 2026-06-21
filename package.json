@@ -1,6 +1,6 @@
 {
   "name": "@miguelangelo78/mql5-transpiler",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Transpiles MQL5 source into TypeScript and runs the strategy on a pluggable backtest/live engine.",
   "license": "MIT",

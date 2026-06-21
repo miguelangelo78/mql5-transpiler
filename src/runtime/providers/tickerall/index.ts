@@ -35,14 +35,23 @@ import {
 export interface TickerallProviderConfig {
   /** TickerAll API key (cf_api_… / cf_live_…). */
   apiKey: string;
-  /** 'mt4' | 'mt5'. */
-  broker: 'mt4' | 'mt5';
-  /** Broker server name, e.g. 'FBS-Demo'. */
-  server: string;
-  /** Numeric broker login. */
-  account: number;
-  /** Broker password (sent once; TickerAll never persists it). */
-  password: string;
+  /**
+   * Attach to an ALREADY-WARM account by its TickerAll account id (from
+   * `accounts.list()`), skipping the broker-credential warm-up. When set,
+   * broker/server/account/password are not required. Use this to control an
+   * account that's already connected (status CONNECTED) without re-supplying the
+   * broker login. To warm a cooled/new account instead, omit this and pass the
+   * broker credentials below.
+   */
+  accountId?: string;
+  /** 'mt4' | 'mt5'. Required only when warming with credentials (no accountId). */
+  broker?: 'mt4' | 'mt5';
+  /** Broker server name, e.g. 'FBS-Demo'. Required only when warming. */
+  server?: string;
+  /** Numeric broker login. Required only when warming. */
+  account?: number;
+  /** Broker password (sent once; TickerAll never persists it). Required only when warming. */
+  password?: string;
   /** The (broker-native) symbol the EA is bound to, e.g. 'EURUSD'. */
   symbol: string;
   /** MT5 ENUM_TIMEFRAMES id (1=M1, 5=M5, 15=M15, …). */
@@ -84,19 +93,29 @@ export async function createTickerallProviders(
     onRearm: config.onRearm ?? ((id) => { process.stderr.write(`[tickerall] re-armed cooled account ${id}\n`); }),
   });
 
-  // 1. Connect the broker account — keepAlive (NOT start): it caches the broker
-  //    credentials in-process so the SDK client TRANSPARENTLY re-arms (re-supplies
-  //    creds + retries) whenever a later call hits BROKER_ACCOUNT_NOT_HOT (the
-  //    account "went cold"). A long-running live EA must survive its connection
-  //    cooling without manual reconnects; plain start() would not. disconnect()
-  //    -> sessions.end() also stops keeping it alive (drops the cached creds).
-  const session = await client.sessions.keepAlive({
-    broker: config.broker,
-    server: config.server,
-    account: config.account,
-    password: config.password,
-  });
-  const accountId = session.accountId;
+  // 1. Resolve the account id. Either attach to an already-warm account by id
+  //    (no credentials), or warm one with keepAlive. keepAlive (NOT start)
+  //    caches the broker credentials in-process so the SDK client TRANSPARENTLY
+  //    re-arms (re-supplies creds + retries) whenever a later call hits
+  //    BROKER_ACCOUNT_NOT_HOT (the account "went cold"). disconnect() ->
+  //    sessions.end() also stops keeping it alive (drops the cached creds).
+  let accountId: string;
+  if (config.accountId !== undefined) {
+    accountId = config.accountId;
+  } else {
+    if (config.broker === undefined || config.server === undefined || config.account === undefined || config.password === undefined) {
+      throw new Error(
+        'createTickerallProviders: pass either `accountId` (attach to a warm account) or `broker`+`server`+`account`+`password` (to warm one).',
+      );
+    }
+    const session = await client.sessions.keepAlive({
+      broker: config.broker,
+      server: config.server,
+      account: config.account,
+      password: config.password,
+    });
+    accountId = session.accountId;
+  }
 
   const clock = new TickerallClock();
   const feed = new TickerallFeed(config.symbol, config.timeframe);
