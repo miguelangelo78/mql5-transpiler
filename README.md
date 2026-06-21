@@ -182,6 +182,29 @@ same `IBroker` / `IMarketFeed` / `IClock` boundary over [`@tickerall/sdk`](https
 (so `IMarketFeed.history()` stays synchronous over the async API), streams live ticks/positions, and
 returns the providers + a `disconnect()`. The **same transpiled EA** runs live or in backtest.
 
+### Backtest the history, then continue live — one EA, one session (`--replay-history`)
+
+Add `--replay-history` and `ea:live` runs the EA as **two phases of a single
+session**: Phase 1 replays the pre-fetched history as a backtest (printing a
+report), then Phase 2 keeps the **same EA instance** running live — its internal
+state (indicator handles, counters) carries across the seam unbroken.
+
+```bash
+TICKERALL_API_KEY=cf_api_... BROKER_PASSWORD=yourBrokerPassword \
+  npm run ea:live -- examples/MovingAverageCross.mq5 \
+    --server FBS-Demo --account 12345678 --symbol BTCUSD --timeframe D1 \
+    --history 500 --replay-history --duration 60
+```
+
+The EA is unchanged — only which providers it resolves to changes at the seam (it
+runs over a stable provider facade that flips from the backtest sim to the live
+broker). Honest model (see [`engine/replay-live-driver.ts`](src/engine/replay-live-driver.ts)):
+`OnInit` fires once at the start, `OnDeinit` once at the end. **Broker state does
+not carry** — a paper position from Phase 1 is on the simulated broker; at the
+seam the EA's position/account view switches to the **real** account (typically
+flat). And the Phase-1 report uses the bar-tier sim (no spread/swap/commission),
+so it's an analysis artifact, not a prediction of the live fills.
+
 ## Fidelity & limitations (honest)
 
 - **Bar-based tier.** Pending / SL / TP fill intrabar from the bar OHLC — limits fill at the

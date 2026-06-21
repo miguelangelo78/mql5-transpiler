@@ -17,11 +17,19 @@
  *   --timeframe <TF>     M1|M5|M15|M30|H1|H4|D1 or the id        (default M5)
  *   --duration <sec>     run for this long then stop             (default 60)
  *   --history <N>        bars of history to pre-fetch            (default 500)
+ *   --replay-history     backtest the pre-fetched history first  (default off)
+ *                        (prints a report), THEN continue live on the SAME EA
  *   --input <Name=Value> set an EA input (repeatable)
  *
  * It transpiles your EA, refuses (with the honesty diagnostics) if it uses an
  * unsupported builtin, then runs it live: OnTick on each market tick, OnTimer on
  * the timer. Trades go to the (demo or real) account. Use a DEMO account first.
+ *
+ * With --replay-history it first replays the pre-fetched bars as a backtest
+ * (Phase 1, simulated fills + a report), then keeps the SAME EA instance running
+ * live (Phase 2). One continuous session: OnInit once, OnDeinit once. At the seam
+ * the EA's position/account view switches to the real account (paper positions
+ * are not carried — see engine/replay-live-driver.ts).
  */
 
 import { resolve } from 'node:path';
@@ -29,6 +37,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { transpileFile } from './transpile';
 import { runLive } from '../engine/live-driver';
+import { runReplayThenLive } from '../engine/replay-live-driver';
+import { printReport } from '../engine/report-print';
 import { createTickerallProviders } from '../runtime/providers/tickerall';
 import { formatDiagnostics, hasErrors, countBySeverity } from '../diagnostics';
 import type { ExpertFactory, Inputs } from '../runtime/runtime';
@@ -62,10 +72,13 @@ interface Args {
   durationSec: number;
   history: number;
   inputs: Inputs;
+  /** --replay-history: backtest the pre-fetched history first (printing a
+   *  report), then continue live on the SAME EA instance. */
+  replayHistory: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-  const out: Args = { file: '', broker: 'mt5', timeframe: 5, durationSec: 60, history: 500, inputs: {} };
+  const out: Args = { file: '', broker: 'mt5', timeframe: 5, durationSec: 60, history: 500, inputs: {}, replayHistory: false };
   const positional: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
@@ -84,6 +97,7 @@ function parseArgs(argv: string[]): Args {
       case 'timeframe': out.timeframe = parseTimeframe(need()); break;
       case 'duration': out.durationSec = Number(need()); break;
       case 'history': out.history = Number(need()); break;
+      case 'replay-history': out.replayHistory = true; break; // bare flag, no value
       case 'input': {
         const pair = need();
         const eq = pair.indexOf('=');
@@ -152,29 +166,75 @@ async function main(): Promise<void> {
   });
 
   const acc = live.providers.broker.account();
-  process.stdout.write(
-    `Connected (accountId ${live.accountId}). Balance ${acc.balance.toFixed(2)} ${acc.currency}, ` +
-    `equity ${acc.equity.toFixed(2)}. Running OnTick/OnTimer for ${args.durationSec}s …\n`,
-  );
+  const inputs = Object.keys(args.inputs).length > 0 ? args.inputs : undefined;
 
   try {
-    const summary = await runLive({
-      factory,
-      live,
-      symbol: args.symbol!,
-      timeframe: args.timeframe,
-      inputs: Object.keys(args.inputs).length > 0 ? args.inputs : undefined,
-      durationMs: args.durationSec * 1000,
-      onActivity: (what) => process.stdout.write(what === 'timer' ? '⏱' : '·'),
-    });
-    await live.refresh();
-    const positions = live.providers.broker.positions();
-    process.stdout.write(
-      `\n\nDone. Ticks ${summary.ticksHandled}/${summary.ticksSeen}, timer fires ${summary.timerFires}. ` +
-      `Open positions: ${positions.length}.\n`,
-    );
-    for (const p of positions) {
-      process.stdout.write(`  ${p.symbol} ${p.side} ${p.volume} @ ${p.openPrice} profit ${p.profit.toFixed(2)}\n`);
+    if (args.replayHistory) {
+      // Hybrid: backtest the pre-fetched history first (same EA instance), print
+      // the report, then continue live. The bars + spec come from the live feed
+      // that createTickerallProviders already seeded — one fetch, identical data
+      // across both phases.
+      const history = [...live.providers.feed.history(args.symbol!, args.timeframe)];
+      const symbolSpec = live.providers.feed.symbolInfo(args.symbol!);
+      process.stdout.write(
+        `Connected (accountId ${live.accountId}). Balance ${acc.balance.toFixed(2)} ${acc.currency}, ` +
+        `equity ${acc.equity.toFixed(2)}.\n` +
+        `Phase 1 — replaying ${history.length} historical bars as a backtest …\n`,
+      );
+      const { report, live: summary, initFailed } = await runReplayThenLive({
+        factory,
+        history,
+        symbolSpec,
+        initialBalance: acc.balance, // paper-run on your real starting balance
+        live,
+        symbol: args.symbol!,
+        timeframe: args.timeframe,
+        inputs,
+        durationMs: args.durationSec * 1000,
+        // Fires only when OnInit succeeded (the driver returns early on
+        // INIT_FAILED), so reaching here always means we proceed to live.
+        onBacktestComplete: (rep) => {
+          printReport(rep, { transpiledPath: outPath });
+          process.stdout.write(
+            `\nPhase 2 — switching to LIVE on account ${args.account} ` +
+            `(positions now reflect the real account; sim positions are not carried). ` +
+            `Running OnTick/OnTimer for ${args.durationSec}s …\n`,
+          );
+        },
+      });
+      await live.refresh();
+      const positions = live.providers.broker.positions();
+      process.stdout.write(
+        `\n\nDone. ${initFailed ? 'OnInit reported INIT_FAILED — no live run. ' : ''}` +
+        `Live ticks ${summary.ticksHandled}/${summary.ticksSeen}, timer fires ${summary.timerFires}. ` +
+        `Open positions: ${positions.length}. (Phase-1 backtest net ${report.netProfit.toFixed(2)})\n`,
+      );
+      for (const p of positions) {
+        process.stdout.write(`  ${p.symbol} ${p.side} ${p.volume} @ ${p.openPrice} profit ${p.profit.toFixed(2)}\n`);
+      }
+    } else {
+      process.stdout.write(
+        `Connected (accountId ${live.accountId}). Balance ${acc.balance.toFixed(2)} ${acc.currency}, ` +
+        `equity ${acc.equity.toFixed(2)}. Running OnTick/OnTimer for ${args.durationSec}s …\n`,
+      );
+      const summary = await runLive({
+        factory,
+        live,
+        symbol: args.symbol!,
+        timeframe: args.timeframe,
+        inputs,
+        durationMs: args.durationSec * 1000,
+        onActivity: (what) => process.stdout.write(what === 'timer' ? '⏱' : '·'),
+      });
+      await live.refresh();
+      const positions = live.providers.broker.positions();
+      process.stdout.write(
+        `\n\nDone. Ticks ${summary.ticksHandled}/${summary.ticksSeen}, timer fires ${summary.timerFires}. ` +
+        `Open positions: ${positions.length}.\n`,
+      );
+      for (const p of positions) {
+        process.stdout.write(`  ${p.symbol} ${p.side} ${p.volume} @ ${p.openPrice} profit ${p.profit.toFixed(2)}\n`);
+      }
     }
   } finally {
     await live.disconnect();

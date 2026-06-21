@@ -55,42 +55,54 @@ export async function runLive(opts: RunLiveOptions): Promise<LiveRunSummary> {
     return summary;
   }
 
-  // Single lock: handlers never overlap (no double-trade).
+  // Single lock: handlers never overlap (no double-trade). `stopped` makes the
+  // teardown clean — once the run window closes we dispatch NO further
+  // OnTick/OnTimer, so a tick the broker streams AFTER the run ends can never
+  // call into a de-initialised EA (OnDeinit may release indicator handles;
+  // calling OnTick then would throw). We also drain any in-flight handler before
+  // OnDeinit so deinit never overlaps a running OnTick.
   let busy = false;
-  const run = async (kind: 'tick' | 'timer', symbol: string): Promise<void> => {
-    if (busy) return; // drop — the next event re-evaluates with fresh state
+  let stopped = false;
+  let inflight: Promise<void> = Promise.resolve();
+  const dispatch = (kind: 'tick' | 'timer', symbol: string): void => {
+    if (stopped || busy) return; // stopped → tearing down; busy → next event re-evaluates
     busy = true;
-    try {
-      opts.onActivity?.(kind, symbol);
-      if (kind === 'tick') await instance.OnTick?.();
-      else await instance.OnTimer?.();
-    } finally {
-      busy = false;
-    }
+    inflight = (async () => {
+      try {
+        opts.onActivity?.(kind, symbol);
+        if (kind === 'tick') { await instance.OnTick?.(); summary.ticksHandled++; }
+        else await instance.OnTimer?.();
+      } finally {
+        busy = false;
+      }
+    })();
   };
 
   opts.live.onTick((symbol) => {
+    if (stopped) return;
     summary.ticksSeen++;
-    void run('tick', symbol).then(() => { summary.ticksHandled++; });
+    dispatch('tick', symbol);
   });
 
   const timerSec = rt.__timerSeconds?.() ?? 0;
   const timers: NodeJS.Timeout[] = [];
   if (timerSec > 0) {
     timers.push(setInterval(() => {
+      if (stopped) return;
       summary.timerFires++;
-      void run('timer', opts.symbol);
+      dispatch('timer', opts.symbol);
     }, timerSec * 1000));
   }
 
   // Keep the broker caches fresh (positions/account/pending/history).
   const refreshMs = opts.refreshMs ?? 5_000;
-  timers.push(setInterval(() => { void opts.live.refresh(); }, refreshMs));
+  timers.push(setInterval(() => { if (!stopped) void opts.live.refresh(); }, refreshMs));
 
   // Run for the duration (or until aborted).
   const durationMs = opts.durationMs ?? 60_000;
   await new Promise<void>((resolve) => {
     const stop = (): void => {
+      stopped = true;
       for (const t of timers) clearInterval(t);
       opts.signal?.removeEventListener('abort', stop);
       resolve();
@@ -99,6 +111,7 @@ export async function runLive(opts: RunLiveOptions): Promise<LiveRunSummary> {
     opts.signal?.addEventListener('abort', stop, { once: true });
   });
 
+  await inflight;
   await instance.OnDeinit?.(0);
   return summary;
 }
