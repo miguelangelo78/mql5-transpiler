@@ -147,12 +147,22 @@ diagnostics and backtests.** Start with `npm run ea -- examples/HelloWorld.mq5`,
 Beyond the CLI, the transpiler is a **library** — install it and drive the whole
 pipeline from code. (This is the engine the desktop terminal is built on.)
 
+It's published to **GitHub Packages** as `@miguelangelo78/mql5-transpiler`. Add a
+one-line `.npmrc` pointing the scope at GitHub Packages (with a token that has
+`read:packages`), then install:
+
+```ini
+# .npmrc
+@miguelangelo78:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+```
+
 ```bash
-npm install mql5-transpiler
+npm install @miguelangelo78/mql5-transpiler
 ```
 
 ```ts
-import { transpileFile, loadEmittedExpert, runBacktest, fetchHistoryBars } from 'mql5-transpiler';
+import { transpileFile, loadEmittedExpert, runBacktest, fetchHistoryBars } from '@miguelangelo78/mql5-transpiler';
 
 // Transpile an EA and load its factory. Emitted modules are pure JS, loaded via a
 // data: URL — so this runs under plain Node (a server, an Electron app), NOT only tsx.

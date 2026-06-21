@@ -1,9 +1,12 @@
 {
-  "name": "mql5-transpiler",
+  "name": "@miguelangelo78/mql5-transpiler",
   "version": "0.1.0",
   "type": "module",
   "description": "Transpiles MQL5 source into TypeScript and runs the strategy on a pluggable backtest/live engine.",
   "license": "MIT",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "author": "Miguel",
   "repository": {
     "type": "git",
