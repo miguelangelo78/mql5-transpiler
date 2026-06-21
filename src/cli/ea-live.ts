@@ -33,7 +33,7 @@
  */
 
 import { resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 import { transpileFile } from './transpile';
 import { runLive } from '../engine/live-driver';
@@ -41,7 +41,8 @@ import { runReplayThenLive } from '../engine/replay-live-driver';
 import { printReport } from '../engine/report-print';
 import { createTickerallProviders } from '../runtime/providers/tickerall';
 import { formatDiagnostics, hasErrors, countBySeverity } from '../diagnostics';
-import type { ExpertFactory, Inputs } from '../runtime/runtime';
+import { loadEmittedExpert } from '../loadExpert';
+import type { Inputs } from '../runtime/runtime';
 
 const TF: Record<string, number> = {
   M1: 1, M5: 5, M15: 15, M30: 30, H1: 16385, H4: 16388, D1: 16408, W1: 32769, MN1: 49153,
@@ -146,8 +147,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const mod: unknown = await import(pathToFileURL(outPath).href);
-  const factory = (mod as { createExpert?: unknown }).createExpert as ExpertFactory;
+  const factory = await loadEmittedExpert(outPath);
 
   process.stdout.write(
     `✓ ${name} supported. Connecting to ${args.broker.toUpperCase()} ${args.server} ` +

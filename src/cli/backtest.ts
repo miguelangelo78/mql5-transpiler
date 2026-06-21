@@ -13,11 +13,11 @@
  */
 
 import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
 
 import { runBacktest } from '../engine/driver';
 import { printReport } from '../engine/report-print';
-import type { ExpertFactory, Inputs } from '../runtime/runtime';
+import { loadEmittedExpert } from '../loadExpert';
+import type { Inputs } from '../runtime/runtime';
 import type { BacktestConfig } from '../runtime/providers/backtest/index';
 import type { Bar, SymbolSpec } from '../runtime/providers/types';
 
@@ -45,14 +45,9 @@ const PERIOD_M1 = 1;
 
 /** Load an emitted module and run it; returns the report (no printing). */
 export async function runEmittedModule(opts: RunModuleOptions) {
-  const abs = resolve(opts.modulePath);
-  const mod: unknown = await import(pathToFileURL(abs).href);
-  const factory = (mod as { createExpert?: unknown }).createExpert;
-  if (typeof factory !== 'function') {
-    throw new Error(
-      `Module ${abs} does not export a createExpert function (got ${typeof factory}).`,
-    );
-  }
+  // Load via the loader-independent path (pure-JS emitted module → data: URL) so
+  // this runs under plain Node, not only under tsx.
+  const factory = await loadEmittedExpert(resolve(opts.modulePath));
 
   // §29: an explicitly-passed 0 must be honoured; only an absent (undefined)
   // option falls back to the default. `??` does exactly that.
@@ -95,7 +90,7 @@ export async function runEmittedModule(opts: RunModuleOptions) {
       };
 
   return runBacktest({
-    factory: factory as ExpertFactory,
+    factory,
     config,
     inputs: opts.inputs,
   });
