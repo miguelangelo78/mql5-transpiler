@@ -13,7 +13,8 @@
 
 import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { basename, extname, dirname, resolve, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+
+import { isMainModule } from './isMain';
 
 import { compileMql5ToIR } from '../compile';
 import { emitTypeScript } from '../backend/typescript/emit';
@@ -108,9 +109,6 @@ function main(): void {
 
 // Run when invoked directly (tsx src/cli/transpile.ts ...). Guarded so importing
 // this module (e.g. from the poc CLI) does not trigger the CLI.
-const invokedDirectly =
-  process.argv[1] !== undefined &&
-  resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-if (invokedDirectly) {
+if (isMainModule(import.meta.url)) {
   main();
 }

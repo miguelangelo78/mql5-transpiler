@@ -137,11 +137,8 @@ async function main(): Promise<void> {
   }
 }
 
-import { fileURLToPath } from 'node:url';
-const invokedDirectly =
-  process.argv[1] !== undefined &&
-  resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-if (invokedDirectly) {
+import { isMainModule } from './isMain';
+if (isMainModule(import.meta.url)) {
   main().catch((err: unknown) => {
     process.stderr.write(
       `backtest failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`,

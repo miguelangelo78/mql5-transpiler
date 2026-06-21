@@ -33,7 +33,8 @@
  */
 
 import { resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+
+import { isMainModule } from './isMain';
 
 import { transpileFile } from './transpile';
 import { runLive } from '../engine/live-driver';
@@ -241,10 +242,7 @@ async function main(): Promise<void> {
   }
 }
 
-const invokedDirectly =
-  process.argv[1] !== undefined &&
-  resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-if (invokedDirectly) {
+if (isMainModule(import.meta.url)) {
   main().catch((err: unknown) => {
     process.stderr.write(`ea:live failed: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`);
     process.exit(1);
